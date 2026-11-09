@@ -281,3 +281,60 @@ as a non-loopback peer. This is expected: keep the default bridge configuration
 and complete the browser's native sign-in prompt with username `open-design` and
 the `OD_API_TOKEN` value from `.env`. Host networking is no longer required for
 the web UI authentication path.
+
+## OIDC + teams (multi-user, self-hosted)
+
+`deploy/docker-compose.oidc.yml` runs one shared OpenDesign instance for many
+users behind your identity provider. Each user gets a private Personal
+workspace, can create teams and add colleagues by email, and can share a
+project with a team (teammates get read-only access and can duplicate it).
+No external collaboration service is used; teams live in the daemon's SQLite
+database.
+
+```
+browser ──TLS──► caddy (optional) ──► oauth2-proxy ──► open-design (no published ports)
+                                       OIDC login        OD_PROXY_AUTH=1
+                                       X-Forwarded-Email  local team directory
+```
+
+1. Register a confidential OIDC client with redirect URI
+   `https://<host>/oauth2/callback`.
+2. `cp deploy/.env.oidc.example deploy/.env.oidc` and fill it in
+   (`OPEN_DESIGN_PUBLIC_URL`, `OD_ADMIN_EMAILS`, `OIDC_*`,
+   `OAUTH2_PROXY_COOKIE_SECRET`, provider API keys).
+3. Start it, with or without the bundled Caddy TLS terminator:
+
+   ```bash
+   docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc --profile tls up -d --build
+   # or, behind an existing TLS load balancer pointed at 127.0.0.1:4180:
+   docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc up -d --build
+   ```
+
+4. Open the site, sign in, and use **Create team** in the workspace switcher
+   (it opens `/team-admin`). Members you add see the team after a reload.
+
+Daemon settings used by this mode:
+
+| Variable | Meaning |
+| --- | --- |
+| `OD_PROXY_AUTH=1` | Trust the proxy-asserted email; replaces `OD_API_TOKEN`. Non-loopback requests without it get 401. |
+| `OD_PROXY_EMAIL_HEADER` | Header carrying the verified email (default `x-forwarded-email`). |
+| `OD_ADMIN_EMAILS` | Only these users may change shared settings: agent/API keys, MCP, connectors, project locations. |
+| `OD_WORKSPACE_SETTINGS_URL` | Where "Create team" / "Manage" links point (`<public url>/team-admin`). |
+
+Security notes:
+
+- The daemon must be reachable **only** through oauth2-proxy. The compose
+  file publishes no daemon port and keeps the proxy hop on an internal
+  network. Never use `network_mode: host` for either service: proxied traffic
+  would then look like loopback, which this mode trusts for the daemon's own
+  agent subprocesses.
+- Project preview iframes are sandboxed and send no cookies, so
+  `/api/projects/*/preview/<scope>/…` skips the proxy login. The daemon only
+  serves those requests with a valid server-minted scope.
+- Model credentials, agent selection and the daemon-wide memory store are
+  shared. Memory is disabled in this mode so one user's chats never leak into
+  another user's prompts.
+- Agent runs execute as one OS user inside the container. Treat everyone
+  allowed to sign in as trusted with respect to each other's files on disk.
+- One replica only (SQLite). Back up the `open_design_data` volume.

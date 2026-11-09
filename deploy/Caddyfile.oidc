@@ -1,0 +1,12 @@
+# TLS terminator for deploy/docker-compose.oidc.yml (--profile tls).
+# CADDY_TLS: "internal" (default) issues from Caddy's internal CA for intranet
+# hosts; set it to an ACME contact email for a public Let's Encrypt certificate.
+{$OPEN_DESIGN_HOST} {
+	tls {$CADDY_TLS}
+	encode gzip
+	reverse_proxy oauth2-proxy:4180 {
+		# Server-Sent Events must stream without buffering.
+		flush_interval -1
+		header_up X-Forwarded-Proto https
+	}
+}
