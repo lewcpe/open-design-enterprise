@@ -1333,6 +1333,3 @@ index c968d4edc5..65e50f7c59 100644
      // Collab realtime hop-2: the workspace-scoped invalidation SSE. The route
      // registers/deregisters its sink here; the poller below feeds them.
      createSseResponse,
--- 
-2.54.0 (Apple Git-157)
-
