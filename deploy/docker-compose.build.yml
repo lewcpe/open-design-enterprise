@@ -1,0 +1,10 @@
+# Build the patched image from this checkout instead of pulling it:
+#   scripts/apply-patches.sh
+#   docker compose -f deploy/docker-compose.oidc.yml -f deploy/docker-compose.build.yml \
+#     --env-file deploy/.env.oidc up -d --build
+services:
+  open-design:
+    image: open-design-enterprise:local
+    build:
+      context: ../upstream
+      dockerfile: deploy/Dockerfile

@@ -1,0 +1,150 @@
+# Follow upstream OpenDesign releases.
+#
+# Every 6 hours, look up the latest nexu-io/open-design release
+# (tag open-design-vX.Y.Z). If it differs from UPSTREAM_VERSION:
+#   1. re-pin the upstream/ submodule to that tag and re-apply patches/,
+#   2. commit the new pin + refreshed patches + UPSTREAM_VERSION to main,
+#   3. test, build and push ghcr.io/<owner>/<repo>:X.Y.Z, create release vX.Y.Z.
+# If the patches no longer apply, an issue is opened and nothing is published.
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream version to move to (e.g. 0.27.0). Empty = latest release.
+        type: string
+        required: false
+
+permissions:
+  contents: write
+  issues: write
+  packages: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: nexu-io/open-design
+  TAG_PREFIX: open-design-v
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      changed: ${{ steps.target.outputs.changed }}
+      version: ${{ steps.target.outputs.version }}
+      ref: ${{ steps.commit.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: main
+          submodules: true
+          fetch-depth: 1
+
+      - name: Resolve target version
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ -n "${INPUT_VERSION:-}" ]]; then
+            version="${INPUT_VERSION#v}"
+          else
+            tag="$(gh release view -R "$UPSTREAM_REPO" --json tagName -q .tagName)"
+            [[ "$tag" == "$TAG_PREFIX"* ]] || { echo "unexpected upstream tag: $tag" >&2; exit 1; }
+            version="${tag#"$TAG_PREFIX"}"
+          fi
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "bad version: $version" >&2; exit 1; }
+          current="$(tr -d '[:space:]' < UPSTREAM_VERSION)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == "$current" ]]; then
+            echo "already on upstream $version"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "upstream $current -> $version"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Re-pin upstream and re-apply patches
+        if: steps.target.outputs.changed == 'true'
+        id: rebase
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          tag="$TAG_PREFIX$VERSION"
+          # Full history so git am --3way can find the blobs the patches were made against.
+          git -C upstream fetch --quiet --unshallow origin || git -C upstream fetch --quiet origin
+          git -C upstream fetch --quiet --no-tags origin "refs/tags/$tag:refs/tags/$tag"
+          git -C upstream checkout --quiet --detach "$tag^{commit}"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git -C upstream am --3way "$PWD"/patches/*.patch > am.log 2>&1; then
+            cat am.log
+            git -C upstream am --abort || true
+            echo "failed=true" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          cat am.log
+          scripts/export-patches.sh "$tag"
+          echo "$VERSION" > UPSTREAM_VERSION
+          git add UPSTREAM_VERSION
+
+      - name: Open an issue when patches do not apply
+        if: failure() && steps.rebase.outputs.failed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          title="Patches do not apply to upstream OpenDesign $VERSION"
+          if gh issue list -R "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number -q '.[0].number' | grep -q .; then
+            echo "issue already open"; exit 0
+          fi
+          {
+            echo "Upstream released [$TAG_PREFIX$VERSION](https://github.com/$UPSTREAM_REPO/releases/tag/$TAG_PREFIX$VERSION) but \`git am --3way\` failed."
+            echo
+            echo "Fix locally, then push (the build runs on push):"
+            echo
+            echo '```bash'
+            echo "scripts/apply-patches.sh"
+            echo "git -C upstream fetch origin tag $TAG_PREFIX$VERSION"
+            echo "git -C upstream rebase --onto $TAG_PREFIX$VERSION \$(git ls-tree HEAD upstream | awk '{print \$3}')"
+            echo "# resolve conflicts, then:"
+            echo "scripts/export-patches.sh $TAG_PREFIX$VERSION && echo $VERSION > UPSTREAM_VERSION"
+            echo "git add UPSTREAM_VERSION && git commit -m 'chore: track upstream open-design v$VERSION' && git push"
+            echo '```'
+            echo
+            echo "Log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo
+            echo '```'
+            tail -n 40 am.log
+            echo '```'
+          } > body.md
+          gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body-file body.md
+
+      - name: Commit new pin
+        if: steps.target.outputs.changed == 'true'
+        id: commit
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          git commit -m "chore: track upstream open-design v$VERSION"
+          git push origin HEAD:main
+          echo "ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # Pushes made with GITHUB_TOKEN do not trigger other workflows, so call the
+  # build directly for the new commit.
+  build:
+    needs: sync
+    if: needs.sync.outputs.changed == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      ref: ${{ needs.sync.outputs.ref }}
+    permissions:
+      contents: write
+      packages: write
+    secrets: inherit

@@ -9,11 +9,46 @@ code (Apache-2.0, © its authors). It is pinned as the git submodule `upstream/`
 and never edited in this repository.
 
 ```
-upstream/   git submodule → nexu-io/open-design at a pinned commit (unmodified)
-patches/    our changes to OpenDesign, as git format-patch files, applied in order
-deploy/     docker compose stack: oauth2-proxy (OIDC) + patched OpenDesign + optional Caddy
-scripts/    apply-patches.sh / export-patches.sh
+upstream/         git submodule → nexu-io/open-design, pinned to a release tag (unmodified)
+UPSTREAM_VERSION  the upstream release upstream/ is pinned to = our version number
+patches/          our changes to OpenDesign, as git format-patch files, applied in order
+deploy/           docker compose stack: oauth2-proxy (OIDC) + patched OpenDesign + optional Caddy
+scripts/          apply-patches.sh / export-patches.sh
+.github/          upstream-sync (follow upstream releases) and build (test + publish image)
 ```
+
+## Versions and images
+
+Our version is the upstream OpenDesign release we are built on. Upstream tags
+`open-design-v0.27.0` → `UPSTREAM_VERSION` `0.27.0` → image and release `0.27.0`.
+
+| Image tag | Meaning |
+| --- | --- |
+| `ghcr.io/lewcpe/open-design-enterprise:0.27.0` | Newest build on upstream 0.27.0. Moves forward when our patches change. |
+| `ghcr.io/lewcpe/open-design-enterprise:0.27.0-<sha7>` | Immutable build from our commit `<sha7>`. |
+| `ghcr.io/lewcpe/open-design-enterprise:latest` | Newest build overall. |
+
+- **`upstream-sync`** runs every 6 hours, or manually with an optional version. When upstream
+  publishes a new release, it does the following:
+  - pins `upstream/` to the new tag and re-applies `patches/`
+  - commits the new pin and `UPSTREAM_VERSION` to `main`
+  - runs the daemon typecheck and the patch tests
+  - pushes the image
+  - creates the GitHub release `v<version>`
+
+  If the patches no longer apply, it opens an issue that includes the steps to fix them, and
+  publishes nothing.
+- **`build`** runs on every push to `main` that changes the patches, the pin or the scripts. It
+  re-tests the current version, re-publishes its image, and creates release `v<version>` if it
+  doesn't exist yet.
+
+Repository settings this needs:
+- **Workflow permissions** set to *Read and write* (Settings → Actions → General).
+- **`main`** must accept pushes from `github-actions[bot]`.
+
+Set the repository variable `IMAGE_PLATFORMS=linux/amd64,linux/arm64` to also build arm64.
+GHCR packages start out private. Make the package public, or run `docker login ghcr.io` on the
+server.
 
 ## What the patch adds
 
@@ -41,15 +76,24 @@ patched build behaves exactly like upstream.
 
 ## Build and run
 
+Only `deploy/` is needed on the server. The image comes from GHCR.
+
+```bash
+cp deploy/.env.oidc.example deploy/.env.oidc   # fill in the values, incl. OPEN_DESIGN_VERSION
+docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc --profile tls up -d
+# or, behind an existing TLS load balancer pointed at 127.0.0.1:4180:
+docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc up -d
+```
+
+To upgrade, change `OPEN_DESIGN_VERSION`, then run `docker compose ... pull && docker compose ... up -d`.
+
+To build the image yourself from this repository:
+
 ```bash
 git clone --recurse-submodules https://github.com/lewcpe/open-design-enterprise.git
-cd open-design-enterprise
-scripts/apply-patches.sh                       # check out pinned upstream/ and apply patches/
-
-cp deploy/.env.oidc.example deploy/.env.oidc   # fill in the values
-docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc --profile tls up -d --build
-# or, behind an existing TLS load balancer pointed at 127.0.0.1:4180:
-docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc up -d --build
+cd open-design-enterprise && scripts/apply-patches.sh
+docker compose -f deploy/docker-compose.oidc.yml -f deploy/docker-compose.build.yml \
+  --env-file deploy/.env.oidc up -d --build
 ```
 
 1. Register a confidential OIDC client with redirect URI `https://<host>/oauth2/callback`.
@@ -107,15 +151,22 @@ pnpm --filter @open-design/daemon exec vitest run tests/local-teams.test.ts test
 pnpm typecheck
 ```
 
-## Moving to a newer upstream
+## Moving to a newer upstream by hand
+
+`upstream-sync` does this automatically. Do it by hand only when the patches conflict, for
+example for upstream `0.28.0`:
 
 ```bash
 scripts/apply-patches.sh
-git -C upstream fetch origin main
-git -C upstream rebase origin/main          # resolve conflicts in the patch commits
-scripts/export-patches.sh origin/main      # exports patches and stages the new upstream pin
-git commit -m "chore: rebase patches onto upstream <sha>"
+git -C upstream fetch origin tag open-design-v0.28.0
+git -C upstream rebase --onto open-design-v0.28.0 "$(git ls-tree HEAD upstream | awk '{print $3}')"
+# resolve conflicts in the patch commits, then:
+scripts/export-patches.sh open-design-v0.28.0   # exports patches and stages the new upstream pin
+echo 0.28.0 > UPSTREAM_VERSION && git add UPSTREAM_VERSION
+git commit -m "chore: track upstream open-design v0.28.0" && git push   # build publishes :0.28.0
 ```
+
+The push runs `build`, which publishes `:0.28.0` and creates release `v0.28.0`.
 
 Never `git add upstream` by hand while the patches are applied. That would pin the *patched*
 commit, which exists only on your machine.

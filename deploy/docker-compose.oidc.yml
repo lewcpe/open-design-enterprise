@@ -1,10 +1,13 @@
 # Multi-user OpenDesign behind OIDC (oauth2-proxy) with self-service teams.
 #
-#   scripts/apply-patches.sh                        # patch the upstream/ submodule
 #   cp deploy/.env.oidc.example deploy/.env.oidc   # fill in the values
-#   docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc up -d --build
+#   docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc up -d
 #   # with the bundled Caddy TLS terminator:
-#   docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc --profile tls up -d --build
+#   docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc --profile tls up -d
+#
+# Uses the published image ghcr.io/lewcpe/open-design-enterprise:<OPEN_DESIGN_VERSION>
+# (version = upstream OpenDesign release). To build from this checkout instead,
+# run scripts/apply-patches.sh and add -f deploy/docker-compose.build.yml.
 #
 # Security model (see README.md → "Security notes"):
 # - open-design publishes NO ports. Browsers can only reach it through
@@ -18,10 +21,7 @@ name: open-design-oidc
 
 services:
   open-design:
-    image: ${OPEN_DESIGN_IMAGE:-open-design-teams:local}
-    build:
-      context: ../upstream
-      dockerfile: deploy/Dockerfile
+    image: ${OPEN_DESIGN_IMAGE:-ghcr.io/lewcpe/open-design-enterprise}:${OPEN_DESIGN_VERSION:-latest}
     restart: always
     environment:
       NODE_ENV: production

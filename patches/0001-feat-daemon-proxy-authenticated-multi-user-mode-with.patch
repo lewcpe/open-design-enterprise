@@ -387,7 +387,7 @@ index 0000000000..6a22cfa1b7
 +  };
 +}
 diff --git a/apps/daemon/src/collab/project-request-authority.ts b/apps/daemon/src/collab/project-request-authority.ts
-index e11d7cee19..ed1a0124de 100644
+index 76e07eb3a9..b01bbb593b 100644
 --- a/apps/daemon/src/collab/project-request-authority.ts
 +++ b/apps/daemon/src/collab/project-request-authority.ts
 @@ -1,4 +1,8 @@
@@ -1098,7 +1098,7 @@ index ed6b253da3..9cee74d825 100644
        const locations = await configuredProjectLocations();
        const latestRunStatuses = listLatestProjectRunStatuses(db);
 diff --git a/apps/daemon/src/server.ts b/apps/daemon/src/server.ts
-index c968d4edc5..65e50f7c59 100644
+index db74d16779..4f57b86dd9 100644
 --- a/apps/daemon/src/server.ts
 +++ b/apps/daemon/src/server.ts
 @@ -1221,6 +1221,15 @@ import {
@@ -1170,7 +1170,7 @@ index c968d4edc5..65e50f7c59 100644
  
    // Plan §3.K1 — API-token middleware.
    //
-@@ -3584,6 +3626,10 @@ export async function startServer({
+@@ -3583,6 +3625,10 @@ export async function startServer({
      previousLogPath: resolveDaemonPreviousLogPath(runtime),
    });
    const db = openDatabase(PROJECT_ROOT, { dataDir: RUNTIME_DATA_DIR });
@@ -1181,7 +1181,7 @@ index c968d4edc5..65e50f7c59 100644
    daemonHealth?.setStorageProbe(() => readSqlitePageStats({ db, file: db.name }));
    const amrTerminalReportOutbox = createAmrTerminalReportOutboxStore(db);
    // P0-24 N10: notices for turns that end while this process runs (never replayed).
-@@ -3990,11 +4036,25 @@ export async function startServer({
+@@ -3989,11 +4035,25 @@ export async function startServer({
        void revokedWorkspaceRuns?.observeDirectory(proof.actorKey, result.items);
      },
    });
@@ -1212,7 +1212,7 @@ index c968d4edc5..65e50f7c59 100644
    let workspaceHubSubscriptions: WorkspaceHubSubscriptionManager | null = null;
    const quotaHealthyConnections = new Set<string>();
    const verifyExplicitWorkspaceRequestContext = async (input: {
-@@ -4046,17 +4106,33 @@ export async function startServer({
+@@ -4045,17 +4105,33 @@ export async function startServer({
          message: 'the requested workspace is not available to this member',
        };
      }
@@ -1255,7 +1255,7 @@ index c968d4edc5..65e50f7c59 100644
      };
    };
    const verifyWorkspaceReadAuthority = (req: unknown) =>
-@@ -4944,6 +5020,11 @@ export async function startServer({
+@@ -4943,6 +5019,11 @@ export async function startServer({
    const teamProjectsForDisplay = async (
      context: WorkspaceCollabContext | null,
    ): Promise<TeamProject[]> => {
@@ -1267,7 +1267,7 @@ index c968d4edc5..65e50f7c59 100644
      const scope = teamProjectsDisplayScopeFromContext(context);
      if (!scope) return [];
      return withoutLocallyUnsharedProjects(
-@@ -6171,6 +6252,17 @@ export async function startServer({
+@@ -6170,6 +6251,17 @@ export async function startServer({
    const teamMembersForDisplay = async (
      context: WorkspaceCollabContext | null,
    ): Promise<CollabCloudMemberDirectoryEntry[]> => {
@@ -1285,7 +1285,7 @@ index c968d4edc5..65e50f7c59 100644
      if (!teamMembersCache) return [];
      return context ? teamMembersCache(context) : [];
    };
-@@ -6258,6 +6350,16 @@ export async function startServer({
+@@ -6257,6 +6349,16 @@ export async function startServer({
      }).catch(() => undefined);
    };
    let workspaceAnalyticsService: AnalyticsService | null = null;
@@ -1302,7 +1302,7 @@ index c968d4edc5..65e50f7c59 100644
    registerCollabContextRoutes(app, {
      workspaceContext: collab.workspaceContext,
      configuredEnv: configuredAmrEnv,
-@@ -6316,7 +6418,29 @@ export async function startServer({
+@@ -6315,7 +6417,29 @@ export async function startServer({
      listTeamProjects: teamProjectsForDisplay,
      // Expose the collab-cloud member directory so the web client can resolve
      // comment authors + owner names to a name + role.

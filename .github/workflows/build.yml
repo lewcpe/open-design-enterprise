@@ -1,0 +1,162 @@
+# Test the patched daemon and publish the Docker image.
+#
+# Image: ghcr.io/<owner>/<repo>:<upstream version>   e.g. :0.27.0 (latest build of it)
+#        ghcr.io/<owner>/<repo>:<upstream version>-<our short sha>  (immutable)
+#        ghcr.io/<owner>/<repo>:latest
+# The version comes from UPSTREAM_VERSION, which upstream-sync.yml keeps equal to
+# the upstream release tag the upstream/ submodule is pinned to.
+name: build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - patches/**
+      - upstream
+      - UPSTREAM_VERSION
+      - scripts/**
+      - .github/workflows/build.yml
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      ref:
+        description: Commit of this repository to build.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.ref || github.sha }}
+  cancel-in-progress: false
+
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          submodules: true
+          fetch-depth: 1
+
+      - name: Apply patches
+        run: scripts/apply-patches.sh
+
+      - uses: pnpm/action-setup@v6.0.8
+        with:
+          package_json_file: upstream/package.json
+
+      - uses: actions/setup-node@v6.4.0
+        with:
+          node-version: 24.18.0
+          cache: pnpm
+          cache-dependency-path: upstream/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: upstream
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck daemon
+        working-directory: upstream
+        run: pnpm --filter @open-design/daemon typecheck
+
+      - name: Test patched daemon
+        working-directory: upstream/apps/daemon
+        run: pnpm exec vitest run -c vitest.config.ts tests/local-teams.test.ts tests/proxy-identity.test.ts
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          submodules: true
+          fetch-depth: 1
+
+      - name: Apply patches
+        run: scripts/apply-patches.sh
+
+      - name: Resolve version
+        id: version
+        run: |
+          version="$(tr -d '[:space:]' < UPSTREAM_VERSION)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]] || { echo "bad UPSTREAM_VERSION: $version" >&2; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "short=$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$(git -C upstream rev-parse "HEAD~$(ls patches/*.patch | wc -l)")" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.version.outputs.image }}
+          tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
+            type=raw,value=${{ steps.version.outputs.version }}-${{ steps.version.outputs.short }}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=open-design-enterprise
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ inputs.ref || github.sha }}
+            io.github.nexu-io.open-design.version=${{ steps.version.outputs.version }}
+            io.github.nexu-io.open-design.revision=${{ steps.version.outputs.upstream_sha }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/deploy/Dockerfile
+          # Set repository variable IMAGE_PLATFORMS=linux/amd64,linux/arm64 for multi-arch.
+          platforms: ${{ vars.IMAGE_PLATFORMS || 'linux/amd64' }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Creates release v<version> the first time a version is built; no-op afterwards.
+  release:
+    needs: image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub release v${{ needs.image.outputs.version }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.image.outputs.version }}
+          REF: ${{ inputs.ref || github.sha }}
+        run: |
+          tag="v$VERSION"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $tag already exists"; exit 0
+          fi
+          image="ghcr.io/${GITHUB_REPOSITORY,,}:$VERSION"
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$REF" \
+            --title "OpenDesign Enterprise $VERSION" \
+            --notes "Patched build of upstream [OpenDesign $VERSION](https://github.com/nexu-io/open-design/releases/tag/open-design-v$VERSION).
+
+          \`\`\`
+          docker pull $image
+          \`\`\`"
