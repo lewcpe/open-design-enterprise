@@ -1,0 +1,352 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Liu <7runv6se@duck.com>
+Date: Mon, 9 Nov 2026 09:37:07 +0700
+Subject: [PATCH] test(daemon): cover local team store and proxy identity
+ middleware
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/daemon/tests/local-teams.test.ts    | 128 +++++++++++++++
+ apps/daemon/tests/proxy-identity.test.ts | 195 +++++++++++++++++++++++
+ 2 files changed, 323 insertions(+)
+ create mode 100644 apps/daemon/tests/local-teams.test.ts
+ create mode 100644 apps/daemon/tests/proxy-identity.test.ts
+
+diff --git a/apps/daemon/tests/local-teams.test.ts b/apps/daemon/tests/local-teams.test.ts
+new file mode 100644
+index 0000000000..7f57d7b534
+--- /dev/null
++++ b/apps/daemon/tests/local-teams.test.ts
+@@ -0,0 +1,128 @@
++import { mkdtempSync, rmSync } from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++import { afterEach, beforeEach, describe, expect, it } from 'vitest';
++
++import {
++  createLocalTeamStore,
++  localMemberIdForEmail,
++  LocalTeamError,
++  normalizeEmail,
++  personalWorkspaceIdForEmail,
++  type LocalTeamStore,
++} from '../src/collab/local-teams.js';
++import {
++  closeDatabase,
++  ensureWorkspaceProject,
++  insertProject,
++  openDatabase,
++} from '../src/db.js';
++
++const ALICE = 'alice@example.com';
++const BOB = 'bob@example.com';
++const CAROL = 'carol@example.com';
++
++describe('local team store', () => {
++  let tempDir: string;
++  let db: ReturnType<typeof openDatabase>;
++  let store: LocalTeamStore;
++
++  beforeEach(() => {
++    tempDir = mkdtempSync(path.join(os.tmpdir(), 'od-local-teams-'));
++    db = openDatabase(tempDir, { dataDir: path.join(tempDir, '.od') });
++    store = createLocalTeamStore(db);
++  });
++
++  afterEach(() => {
++    closeDatabase();
++    rmSync(tempDir, { recursive: true, force: true });
++  });
++
++  it('normalizes emails and rejects junk', () => {
++    expect(normalizeEmail('  Alice@Example.COM ')).toBe(ALICE);
++    expect(normalizeEmail('not-an-email')).toBeNull();
++    expect(normalizeEmail(42)).toBeNull();
++  });
++
++  it('gives every user exactly one Personal workspace by default', () => {
++    const items = store.directoryFor(ALICE);
++    expect(items).toHaveLength(1);
++    expect(items[0]).toMatchObject({
++      workspaceId: personalWorkspaceIdForEmail(ALICE),
++      workspaceType: 'personal',
++      workspaceMemberId: localMemberIdForEmail(ALICE),
++      role: 'owner',
++      memberStatus: 'active',
++    });
++    expect(store.membershipFor(BOB, personalWorkspaceIdForEmail(ALICE))).toBeNull();
++  });
++
++  it('creates a team owned by its creator and lists it in the directory', () => {
++    const team = store.createTeam(ALICE, ' Design ');
++    expect(team).toMatchObject({ name: 'Design', role: 'owner', memberCount: 1 });
++    const teamItem = store.directoryFor(ALICE).find((item) => item.workspaceId === team.id);
++    expect(teamItem).toMatchObject({ workspaceType: 'team', role: 'owner', workspaceName: 'Design' });
++    expect(store.directoryFor(BOB).some((item) => item.workspaceId === team.id)).toBe(false);
++    expect(() => store.createTeam(ALICE, '   ')).toThrow(LocalTeamError);
++  });
++
++  it('lets owners add admins and members, admins add members only', () => {
++    const team = store.createTeam(ALICE, 'Design');
++    expect(store.addMembers(ALICE, team.id, [
++      { email: BOB, role: 'admin' },
++      { email: 'bad' },
++    ])).toEqual([
++      { email: BOB, ok: true, memberId: localMemberIdForEmail(BOB) },
++      { email: 'bad', ok: false, error: 'invalid_email' },
++    ]);
++    expect(store.addMembers(BOB, team.id, [{ email: CAROL, role: 'admin' }]))
++      .toEqual([{ email: CAROL, ok: false, error: 'forbidden' }]);
++    expect(store.addMembers(BOB, team.id, [{ email: CAROL }]))
++      .toEqual([{ email: CAROL, ok: true, memberId: localMemberIdForEmail(CAROL) }]);
++    expect(store.addMembers(ALICE, team.id, [{ email: CAROL }]))
++      .toEqual([{ email: CAROL, ok: false, error: 'already_member' }]);
++    expect(store.membershipFor(CAROL, team.id)).toMatchObject({ role: 'member' });
++    expect(() => store.addMembers(CAROL, team.id, [{ email: 'dave@example.com' }]))
++      .toThrow(expect.objectContaining({ status: 403 }));
++    expect(() => store.addMembers('eve@example.com', team.id, [{ email: 'x@example.com' }]))
++      .toThrow(expect.objectContaining({ status: 404 }));
++  });
++
++  it('removes members, allows leaving, and protects the last owner', () => {
++    const team = store.createTeam(ALICE, 'Design');
++    store.addMembers(ALICE, team.id, [{ email: BOB }, { email: CAROL }]);
++    expect(() => store.removeMember(BOB, team.id, CAROL)).toThrow(expect.objectContaining({ status: 403 }));
++    store.removeMember(CAROL, team.id, CAROL);
++    expect(store.membershipFor(CAROL, team.id)).toBeNull();
++    expect(() => store.removeMember(ALICE, team.id, ALICE)).toThrow(expect.objectContaining({ code: 'LAST_OWNER' }));
++    store.removeMember(ALICE, team.id, BOB);
++    expect(store.listMembers(team.id).map((member) => member.email)).toEqual([ALICE]);
++  });
++
++  it('exposes the member directory with emails as display names', () => {
++    const team = store.createTeam(ALICE, 'Design');
++    store.addMembers(ALICE, team.id, [{ email: BOB }]);
++    expect(store.memberDirectory(team.id)).toEqual([
++      { memberId: localMemberIdForEmail(ALICE), displayName: ALICE, role: 'owner' },
++      { memberId: localMemberIdForEmail(BOB), displayName: BOB, role: 'member' },
++    ]);
++  });
++
++  it('lists only active team-visible projects of the workspace', () => {
++    const team = store.createTeam(ALICE, 'Design');
++    const now = Date.now();
++    for (const id of ['shared', 'private', 'deleted', 'elsewhere']) {
++      insertProject(db, { id, name: id, createdAt: now, updatedAt: now });
++    }
++    const creator = localMemberIdForEmail(ALICE);
++    ensureWorkspaceProject(db, { projectId: 'shared', workspaceId: team.id, visibility: 'team', createdByWorkspaceMemberId: creator });
++    ensureWorkspaceProject(db, { projectId: 'private', workspaceId: team.id, visibility: 'personal', createdByWorkspaceMemberId: creator });
++    ensureWorkspaceProject(db, { projectId: 'deleted', workspaceId: team.id, visibility: 'team', resourceState: 'deleted', createdByWorkspaceMemberId: creator });
++    ensureWorkspaceProject(db, { projectId: 'elsewhere', workspaceId: personalWorkspaceIdForEmail(ALICE), visibility: 'team', createdByWorkspaceMemberId: creator });
++
++    const projects = store.listTeamProjects(team.id);
++    expect(projects.map((project) => project.projectId)).toEqual(['shared']);
++    expect(projects[0]).toMatchObject({ ownerMemberId: creator, name: 'shared' });
++    expect(store.listTeamProjects('t-missing')).toEqual([]);
++  });
++});
+diff --git a/apps/daemon/tests/proxy-identity.test.ts b/apps/daemon/tests/proxy-identity.test.ts
+new file mode 100644
+index 0000000000..3e1a3ccea0
+--- /dev/null
++++ b/apps/daemon/tests/proxy-identity.test.ts
+@@ -0,0 +1,195 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import type { WorkspaceDirectoryItem } from '@open-design/contracts';
++
++import type { LocalTeamStore } from '../src/collab/local-teams.js';
++import { personalWorkspaceIdForEmail } from '../src/collab/local-teams.js';
++import {
++  createProxyIdentityMiddleware,
++  currentProxyEmail,
++  mayWriteGlobalSettings,
++  proxyMembershipFor,
++  setProxyTeamStore,
++} from '../src/http/proxy-identity.js';
++
++const ALICE = 'alice@example.com';
++const TEAM = 't-design';
++
++function item(overrides: Partial<WorkspaceDirectoryItem>): WorkspaceDirectoryItem {
++  return {
++    workspaceId: TEAM,
++    workspaceName: 'Design',
++    workspaceType: 'team',
++    workspaceMemberId: 'u-alice',
++    role: 'member',
++    memberStatus: 'active',
++    lifecycleState: 'active',
++    ...overrides,
++  };
++}
++
++function fakeStore(): LocalTeamStore {
++  return {
++    membershipFor: (email: string, workspaceId: string) => {
++      if (email !== ALICE) return null;
++      if (workspaceId === TEAM) return item({});
++      if (workspaceId === personalWorkspaceIdForEmail(ALICE)) {
++        return item({ workspaceId, workspaceType: 'personal', role: 'owner', workspaceName: 'Personal' });
++      }
++      return null;
++    },
++  } as unknown as LocalTeamStore;
++}
++
++function fakeReq(input: {
++  headers?: Record<string, string>;
++  method?: string;
++  url?: string;
++  remoteAddress?: string;
++}) {
++  const url = input.url ?? '/api/projects/p1';
++  const req: any = {
++    method: input.method ?? 'GET',
++    url,
++    headers: { ...(input.headers ?? {}) },
++    socket: { remoteAddress: input.remoteAddress ?? '172.18.0.5' },
++  };
++  Object.defineProperty(req, 'path', { get: () => new URL(req.url, 'http://x').pathname });
++  Object.defineProperty(req, 'query', {
++    get: () => Object.fromEntries(new URL(req.url, 'http://x').searchParams),
++  });
++  return req;
++}
++
++function fakeRes() {
++  const res: any = { statusCode: 200, body: undefined };
++  res.status = (code: number) => { res.statusCode = code; return res; };
++  res.json = (body: unknown) => { res.body = body; return res; };
++  return res;
++}
++
++describe('proxy identity middleware', () => {
++  const env = { OD_PROXY_AUTH: '1', OD_ADMIN_EMAILS: 'admin@example.com' } as NodeJS.ProcessEnv;
++  const middleware = createProxyIdentityMiddleware({
++    getStore: () => fakeStore(),
++    isLoopbackPeer: (address) => address === '127.0.0.1',
++    env,
++  });
++
++  beforeEach(() => {
++    vi.stubEnv('OD_PROXY_AUTH', '1');
++    vi.stubEnv('OD_ADMIN_EMAILS', 'admin@example.com');
++    setProxyTeamStore(fakeStore());
++  });
++  afterEach(() => {
++    vi.unstubAllEnvs();
++    setProxyTeamStore(null);
++  });
++
++  it('rejects non-loopback requests without the proxy email header', () => {
++    const next = vi.fn();
++    const res = fakeRes();
++    middleware(fakeReq({}), res, next);
++    expect(next).not.toHaveBeenCalled();
++    expect(res.statusCode).toBe(401);
++  });
++
++  it('lets loopback (agent subprocess / health check) requests through untouched', () => {
++    const next = vi.fn();
++    const req = fakeReq({ remoteAddress: '127.0.0.1', headers: { 'x-od-workspace-id': TEAM } });
++    middleware(req, fakeRes(), next);
++    expect(next).toHaveBeenCalledOnce();
++    expect(req.headers['x-od-workspace-id']).toBe(TEAM);
++  });
++
++  it('replaces spoofed workspace headers with the verified membership', () => {
++    let seenEmail: string | null = null;
++    const req = fakeReq({
++      headers: {
++        'x-forwarded-email': 'Alice@Example.com',
++        'x-od-workspace-id': TEAM,
++        'x-od-workspace-member-id': 'u-mallory',
++        'x-od-workspace-role': 'owner',
++        'x-od-app-user-id': 'mallory',
++      },
++    });
++    middleware(req, fakeRes(), () => { seenEmail = currentProxyEmail(); });
++    expect(seenEmail).toBe(ALICE);
++    expect(req.headers).toMatchObject({
++      'x-od-workspace-id': TEAM,
++      'x-od-workspace-member-id': 'u-alice',
++      'x-od-workspace-role': 'member',
++      'x-od-workspace-type': 'team',
++      'x-od-app-user-id': ALICE,
++    });
++  });
++
++  it('denies workspaces the user is not a member of', () => {
++    const next = vi.fn();
++    const res = fakeRes();
++    middleware(fakeReq({ headers: { 'x-forwarded-email': ALICE, 'x-od-workspace-id': 't-other' } }), res, next);
++    expect(next).not.toHaveBeenCalled();
++    expect(res.statusCode).toBe(403);
++  });
++
++  it('rewrites EventSource navigation query params to the verified pair', () => {
++    const req = fakeReq({
++      url: `/api/workspace/events?workspaceId=${TEAM}&workspaceMemberId=u-mallory`,
++      headers: { 'x-forwarded-email': ALICE },
++    });
++    middleware(req, fakeRes(), () => undefined);
++    expect(req.query).toMatchObject({ workspaceId: TEAM, workspaceMemberId: 'u-alice' });
++    expect(req.headers['x-od-workspace-member-id']).toBe('u-alice');
++  });
++
++  it('scopes unscoped writes to the caller Personal workspace and leaves unscoped reads unscoped', () => {
++    const write = fakeReq({ method: 'POST', url: '/api/projects', headers: { 'x-forwarded-email': ALICE } });
++    middleware(write, fakeRes(), () => undefined);
++    expect(write.headers['x-od-workspace-id']).toBe(personalWorkspaceIdForEmail(ALICE));
++    expect(write.headers['x-od-workspace-type']).toBe('personal');
++
++    const read = fakeReq({ headers: { 'x-forwarded-email': ALICE, 'x-od-workspace-member-id': 'u-mallory' } });
++    middleware(read, fakeRes(), () => undefined);
++    expect(read.headers['x-od-workspace-id']).toBeUndefined();
++    expect(read.headers['x-od-workspace-member-id']).toBeUndefined();
++  });
++
++  it('accepts valid preview scopes without identity and never trusts headers on bad ones', () => {
++    const previewMiddleware = createProxyIdentityMiddleware({
++      getStore: () => fakeStore(),
++      isLoopbackPeer: () => false,
++      classifyPreviewRequest: (req) =>
++        req.path.includes('/preview/') ? (req.path.includes('/good/') ? 'valid' : 'invalid') : null,
++      env,
++    });
++    const okNext = vi.fn();
++    const ok = fakeReq({ url: '/api/projects/p1/preview/good/index.html', headers: { 'x-od-workspace-id': TEAM } });
++    previewMiddleware(ok, fakeRes(), okNext);
++    expect(okNext).toHaveBeenCalledOnce();
++    expect(ok.headers['x-od-workspace-id']).toBeUndefined();
++
++    const badNext = vi.fn();
++    const badRes = fakeRes();
++    previewMiddleware(
++      fakeReq({ url: '/api/projects/p1/preview/bad/index.html', headers: { 'x-forwarded-email': ALICE } }),
++      badRes,
++      badNext,
++    );
++    expect(badNext).not.toHaveBeenCalled();
++    expect(badRes.statusCode).toBe(401);
++  });
++
++  it('resolves membership and admin rights only inside a proxied request', () => {
++    expect(proxyMembershipFor(TEAM)).toBeUndefined();
++    expect(mayWriteGlobalSettings()).toBe(true);
++    const req = fakeReq({ headers: { 'x-forwarded-email': ALICE } });
++    middleware(req, fakeRes(), () => {
++      expect(proxyMembershipFor(TEAM)).toMatchObject({ workspaceMemberId: 'u-alice' });
++      expect(proxyMembershipFor('t-other')).toBeNull();
++      expect(mayWriteGlobalSettings()).toBe(false);
++    });
++    const admin = fakeReq({ headers: { 'x-forwarded-email': 'admin@example.com' } });
++    middleware(admin, fakeRes(), () => {
++      expect(mayWriteGlobalSettings()).toBe(true);
++    });
++  });
++});
+-- 
+2.54.0 (Apple Git-157)
+

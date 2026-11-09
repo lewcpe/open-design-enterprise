@@ -1,0 +1,1338 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Liu <7runv6se@duck.com>
+Date: Mon, 9 Nov 2026 09:37:06 +0700
+Subject: [PATCH] feat(daemon): proxy-authenticated multi-user mode with local
+ teams
+
+Add OD_PROXY_AUTH=1 for self-hosted deployments behind an authenticating
+reverse proxy (e.g. oauth2-proxy). The daemon trusts the proxy-asserted
+email header and replaces the Vela workspace directory with a local
+SQLite team store:
+
+- collab/local-teams.ts: teams + members tables; every user gets a
+  Personal workspace plus one directory entry per team membership.
+- http/proxy-identity.ts: requires the email on non-loopback requests,
+  strips client x-od-workspace-* headers and re-derives them from the
+  local directory (403 for non-members); admin gate for shared settings.
+- Project gate: in proxy mode unbound projects are denied and headerless
+  requests are scoped to the project's workspace for the verified user.
+- Workspace directory, members, team catalog and invites are served
+  from the local store; /team-admin page manages teams and members.
+- Memory is disabled in proxy mode (daemon-wide store would leak
+  between users); OD_WORKSPACE_SETTINGS_URL points team management links
+  at the local page.
+
+Upstream behavior is unchanged when OD_PROXY_AUTH is unset.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ apps/daemon/src/collab/local-teams.ts         | 338 ++++++++++++++++++
+ .../src/collab/project-request-authority.ts   |  31 +-
+ apps/daemon/src/collab/workspace-context.ts   |   4 +
+ apps/daemon/src/http/proxy-identity.ts        | 234 ++++++++++++
+ apps/daemon/src/memory.ts                     |  14 +
+ apps/daemon/src/routes/collab-context.ts      |  21 ++
+ apps/daemon/src/routes/local-teams-page.ts    | 190 ++++++++++
+ apps/daemon/src/routes/local-teams.ts         | 104 ++++++
+ apps/daemon/src/routes/project/index.ts       |   6 +
+ apps/daemon/src/server.ts                     | 158 +++++++-
+ 10 files changed, 1082 insertions(+), 18 deletions(-)
+ create mode 100644 apps/daemon/src/collab/local-teams.ts
+ create mode 100644 apps/daemon/src/http/proxy-identity.ts
+ create mode 100644 apps/daemon/src/routes/local-teams-page.ts
+ create mode 100644 apps/daemon/src/routes/local-teams.ts
+
+diff --git a/apps/daemon/src/collab/local-teams.ts b/apps/daemon/src/collab/local-teams.ts
+new file mode 100644
+index 0000000000..6a22cfa1b7
+--- /dev/null
++++ b/apps/daemon/src/collab/local-teams.ts
+@@ -0,0 +1,338 @@
++// Local (self-hosted) team directory for proxy-authenticated deployments.
++//
++// When OD_PROXY_AUTH=1 the daemon serves many users at once behind an OIDC
++// reverse proxy. Identity is the proxy-asserted email; team membership lives in
++// two SQLite tables owned by this module instead of the Vela cloud directory.
++// Every user implicitly owns one Personal workspace, plus one directory entry
++// per team they belong to. The rest of the daemon consumes these entries
++// through the existing `WorkspaceDirectoryItem` contract, so the project
++// visibility gate and the web workspace UI work unchanged.
++
++import { createHash, randomBytes } from 'node:crypto';
++import type Database from 'better-sqlite3';
++import type {
++  CollabCloudMemberDirectoryEntry,
++  CollabMemberRole,
++  TeamProject,
++  WorkspaceDirectoryItem,
++} from '@open-design/contracts';
++
++type SqliteDb = Database.Database;
++
++export const LOCAL_TEAM_ROLES = ['owner', 'admin', 'member'] as const;
++export type LocalTeamRole = (typeof LOCAL_TEAM_ROLES)[number];
++
++const MAX_TEAM_NAME_LENGTH = 120;
++const MAX_EMAIL_LENGTH = 254;
++const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+$/;
++
++export function migrateLocalTeams(db: SqliteDb): void {
++  db.exec(`
++    CREATE TABLE IF NOT EXISTS local_teams (
++      id TEXT PRIMARY KEY,
++      name TEXT NOT NULL,
++      created_by_email TEXT NOT NULL,
++      created_at INTEGER NOT NULL
++    );
++
++    CREATE TABLE IF NOT EXISTS local_team_members (
++      team_id TEXT NOT NULL,
++      email TEXT NOT NULL,
++      role TEXT NOT NULL CHECK (role IN ('owner', 'admin', 'member')),
++      added_by_email TEXT,
++      added_at INTEGER NOT NULL,
++      PRIMARY KEY (team_id, email),
++      FOREIGN KEY(team_id) REFERENCES local_teams(id) ON DELETE CASCADE
++    );
++
++    CREATE INDEX IF NOT EXISTS idx_local_team_members_email
++      ON local_team_members(email);
++  `);
++}
++
++export function normalizeEmail(value: unknown): string | null {
++  if (typeof value !== 'string') return null;
++  const email = value.trim().toLowerCase();
++  if (!email || email.length > MAX_EMAIL_LENGTH || !EMAIL_PATTERN.test(email)) return null;
++  return email;
++}
++
++function digest(prefix: string, email: string, length: number): string {
++  return `${prefix}${createHash('sha256').update(email).digest('hex').slice(0, length)}`;
++}
++
++/** Stable, opaque member id for an email (safe in headers, URLs, file names). */
++export function localMemberIdForEmail(email: string): string {
++  return digest('u-', email, 24);
++}
++
++/** Every user's implicit Personal workspace id. */
++export function personalWorkspaceIdForEmail(email: string): string {
++  return digest('p-', email, 24);
++}
++
++export interface LocalTeam {
++  id: string;
++  name: string;
++  createdByEmail: string;
++  createdAt: number;
++  role: LocalTeamRole;
++  memberCount: number;
++}
++
++export interface LocalTeamMember {
++  email: string;
++  memberId: string;
++  role: LocalTeamRole;
++  addedByEmail: string | null;
++  addedAt: number;
++}
++
++export class LocalTeamError extends Error {
++  constructor(
++    readonly status: 400 | 403 | 404 | 409,
++    readonly code: string,
++    message: string,
++  ) {
++    super(message);
++    this.name = 'LocalTeamError';
++  }
++}
++
++function asRole(value: unknown): LocalTeamRole {
++  return value === 'owner' || value === 'admin' ? value : 'member';
++}
++
++export interface LocalTeamStore {
++  directoryFor(email: string): WorkspaceDirectoryItem[];
++  /** The caller's directory entry for one workspace, or null if not a member. */
++  membershipFor(email: string, workspaceId: string): WorkspaceDirectoryItem | null;
++  listTeams(email: string): LocalTeam[];
++  createTeam(email: string, name: unknown): LocalTeam;
++  renameTeam(email: string, teamId: string, name: unknown): void;
++  listMembers(teamId: string): LocalTeamMember[];
++  memberDirectory(workspaceId: string): CollabCloudMemberDirectoryEntry[];
++  addMembers(
++    byEmail: string,
++    teamId: string,
++    items: Array<{ email: unknown; role?: unknown }>,
++  ): Array<{ email: string; ok: boolean; error?: string; memberId?: string }>;
++  removeMember(byEmail: string, teamId: string, email: unknown): void;
++  listTeamProjects(workspaceId: string): TeamProject[];
++}
++
++export function createLocalTeamStore(db: SqliteDb): LocalTeamStore {
++  migrateLocalTeams(db);
++
++  const memberRow = (teamId: string, email: string) =>
++    db
++      .prepare(`SELECT role FROM local_team_members WHERE team_id = ? AND email = ?`)
++      .get(teamId, email) as { role: string } | undefined;
++
++  const teamExists = (teamId: string) =>
++    Boolean(db.prepare(`SELECT 1 FROM local_teams WHERE id = ?`).get(teamId));
++
++  const requireManager = (byEmail: string, teamId: string): LocalTeamRole => {
++    if (!teamExists(teamId)) throw new LocalTeamError(404, 'TEAM_NOT_FOUND', 'team not found');
++    const row = memberRow(teamId, byEmail);
++    if (!row) throw new LocalTeamError(404, 'TEAM_NOT_FOUND', 'team not found');
++    const role = asRole(row.role);
++    if (role === 'member') {
++      throw new LocalTeamError(403, 'FORBIDDEN', 'only team owners and admins can manage members');
++    }
++    return role;
++  };
++
++  const ownerCount = (teamId: string) =>
++    (db
++      .prepare(`SELECT COUNT(*) AS n FROM local_team_members WHERE team_id = ? AND role = 'owner'`)
++      .get(teamId) as { n: number }).n;
++
++  const parseName = (name: unknown): string => {
++    const value = typeof name === 'string' ? name.trim() : '';
++    if (!value || value.length > MAX_TEAM_NAME_LENGTH) {
++      throw new LocalTeamError(400, 'INVALID_TEAM_NAME', 'team name must be 1-120 characters');
++    }
++    return value;
++  };
++
++  const listTeams = (email: string): LocalTeam[] =>
++    (db
++      .prepare(
++        `SELECT t.id, t.name, t.created_by_email, t.created_at, m.role,
++                (SELECT COUNT(*) FROM local_team_members c WHERE c.team_id = t.id) AS member_count
++           FROM local_team_members m
++           JOIN local_teams t ON t.id = m.team_id
++          WHERE m.email = ?
++          ORDER BY t.name COLLATE NOCASE, t.id`,
++      )
++      .all(email) as Array<Record<string, any>>).map((row) => ({
++      id: String(row.id),
++      name: String(row.name),
++      createdByEmail: String(row.created_by_email),
++      createdAt: Number(row.created_at),
++      role: asRole(row.role),
++      memberCount: Number(row.member_count),
++    }));
++
++  const personalItem = (email: string): WorkspaceDirectoryItem => ({
++    workspaceId: personalWorkspaceIdForEmail(email),
++    workspaceName: 'Personal',
++    workspaceType: 'personal',
++    workspaceMemberId: localMemberIdForEmail(email),
++    role: 'owner',
++    memberStatus: 'active',
++    lifecycleState: 'active',
++    memberCount: 1,
++    isDefault: true,
++  });
++
++  const teamItem = (email: string, team: LocalTeam): WorkspaceDirectoryItem => ({
++    workspaceId: team.id,
++    workspaceName: team.name,
++    workspaceType: 'team',
++    workspaceMemberId: localMemberIdForEmail(email),
++    role: team.role as CollabMemberRole,
++    memberStatus: 'active',
++    lifecycleState: 'active',
++    memberCount: team.memberCount,
++  });
++
++  const directoryFor = (email: string): WorkspaceDirectoryItem[] => [
++    personalItem(email),
++    ...listTeams(email).map((team) => teamItem(email, team)),
++  ];
++
++  const listMembers = (teamId: string): LocalTeamMember[] =>
++    (db
++      .prepare(
++        `SELECT email, role, added_by_email, added_at
++           FROM local_team_members
++          WHERE team_id = ?
++          ORDER BY CASE role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, email`,
++      )
++      .all(teamId) as Array<Record<string, any>>).map((row) => ({
++      email: String(row.email),
++      memberId: localMemberIdForEmail(String(row.email)),
++      role: asRole(row.role),
++      addedByEmail: row.added_by_email == null ? null : String(row.added_by_email),
++      addedAt: Number(row.added_at),
++    }));
++
++  return {
++    directoryFor,
++
++    membershipFor(email, workspaceId) {
++      if (workspaceId === personalWorkspaceIdForEmail(email)) return personalItem(email);
++      const team = listTeams(email).find((entry) => entry.id === workspaceId);
++      return team ? teamItem(email, team) : null;
++    },
++
++    listTeams,
++
++    createTeam(email, name) {
++      const teamName = parseName(name);
++      const id = `t-${randomBytes(12).toString('hex')}`;
++      const now = Date.now();
++      db.transaction(() => {
++        db.prepare(
++          `INSERT INTO local_teams (id, name, created_by_email, created_at) VALUES (?, ?, ?, ?)`,
++        ).run(id, teamName, email, now);
++        db.prepare(
++          `INSERT INTO local_team_members (team_id, email, role, added_by_email, added_at)
++           VALUES (?, ?, 'owner', ?, ?)`,
++        ).run(id, email, email, now);
++      })();
++      return { id, name: teamName, createdByEmail: email, createdAt: now, role: 'owner', memberCount: 1 };
++    },
++
++    renameTeam(email, teamId, name) {
++      requireManager(email, teamId);
++      db.prepare(`UPDATE local_teams SET name = ? WHERE id = ?`).run(parseName(name), teamId);
++    },
++
++    listMembers,
++
++    memberDirectory(workspaceId) {
++      return listMembers(workspaceId).map((member) => ({
++        memberId: member.memberId,
++        displayName: member.email,
++        role: member.role as CollabMemberRole,
++      }));
++    },
++
++    addMembers(byEmail, teamId, items) {
++      const byRole = requireManager(byEmail, teamId);
++      const now = Date.now();
++      const upsert = db.prepare(
++        `INSERT INTO local_team_members (team_id, email, role, added_by_email, added_at)
++         VALUES (?, ?, ?, ?, ?)
++         ON CONFLICT(team_id, email) DO NOTHING`,
++      );
++      return items.map((item) => {
++        const email = normalizeEmail(item.email);
++        if (!email) return { email: String(item.email ?? ''), ok: false, error: 'invalid_email' };
++        const role: LocalTeamRole = item.role === 'admin' ? 'admin' : 'member';
++        if (role === 'admin' && byRole !== 'owner') {
++          return { email, ok: false, error: 'forbidden' };
++        }
++        const result = upsert.run(teamId, email, role, byEmail, now);
++        if (result.changes === 0) return { email, ok: false, error: 'already_member' };
++        return { email, ok: true, memberId: localMemberIdForEmail(email) };
++      });
++    },
++
++    removeMember(byEmail, teamId, rawEmail) {
++      const email = normalizeEmail(rawEmail);
++      if (!email) throw new LocalTeamError(400, 'INVALID_EMAIL', 'invalid email');
++      const target = memberRow(teamId, email);
++      if (!target) throw new LocalTeamError(404, 'MEMBER_NOT_FOUND', 'member not found');
++      const targetRole = asRole(target.role);
++      if (email !== byEmail) {
++        const byRole = requireManager(byEmail, teamId);
++        if (targetRole === 'owner' && byRole !== 'owner') {
++          throw new LocalTeamError(403, 'FORBIDDEN', 'only owners can remove an owner');
++        }
++      }
++      if (targetRole === 'owner' && ownerCount(teamId) <= 1) {
++        throw new LocalTeamError(409, 'LAST_OWNER', 'a team must keep at least one owner');
++      }
++      db.prepare(`DELETE FROM local_team_members WHERE team_id = ? AND email = ?`).run(teamId, email);
++    },
++
++    listTeamProjects(workspaceId) {
++      if (!teamExists(workspaceId)) return [];
++      return (db
++        .prepare(
++          `SELECT wp.project_id, wp.created_by_workspace_member_id, wp.updated_at AS shared_at,
++                  p.name, p.skill_id, p.design_system_id, p.metadata_json,
++                  p.created_at, p.updated_at
++             FROM workspace_projects wp
++             JOIN projects p ON p.id = wp.project_id
++            WHERE wp.workspace_id = ?
++              AND wp.visibility = 'team'
++              AND wp.resource_state = 'active'
++            ORDER BY p.updated_at DESC`,
++        )
++        .all(workspaceId) as Array<Record<string, any>>).map((row) => {
++        let metadata: TeamProject['metadata'];
++        try {
++          metadata = row.metadata_json ? JSON.parse(String(row.metadata_json)) : undefined;
++        } catch {
++          metadata = undefined;
++        }
++        return {
++          projectId: String(row.project_id),
++          ownerMemberId: String(row.created_by_workspace_member_id ?? ''),
++          sharedAt: new Date(Number(row.shared_at)).toISOString(),
++          name: String(row.name),
++          skillId: row.skill_id ?? null,
++          designSystemId: row.design_system_id ?? null,
++          createdAt: Number(row.created_at),
++          updatedAt: Number(row.updated_at),
++          ...(metadata ? { metadata } : {}),
++        };
++      });
++    },
++  };
++}
+diff --git a/apps/daemon/src/collab/project-request-authority.ts b/apps/daemon/src/collab/project-request-authority.ts
+index e11d7cee19..ed1a0124de 100644
+--- a/apps/daemon/src/collab/project-request-authority.ts
++++ b/apps/daemon/src/collab/project-request-authority.ts
+@@ -1,4 +1,8 @@
+ import type { Response } from 'express';
++import {
++  applyWorkspaceIdentityHeaders,
++  proxyMembershipFor,
++} from '../http/proxy-identity.js';
+ import {
+   requestWithWorkspaceNavigationScope,
+   workspaceResourceContextFromRequest,
+@@ -214,7 +218,32 @@ export async function enforceLocalProjectDataPlaneRequest(input: {
+     return false;
+   };
+   const persisted = getWorkspaceProjectByProjectId(db, projectId);
+-  if (!persisted?.workspaceId) return true;
++  // Proxy-authenticated multi-user mode (OD_PROXY_AUTH): there is no shared
++  // "unbound" bucket, and requests that name no workspace (iframes, <img>,
++  // downloads) are scoped to the project's own workspace for the verified user.
++  const proxyMembership = persisted?.workspaceId
++    ? proxyMembershipFor(persisted.workspaceId)
++    : proxyMembershipFor('');
++  if (!persisted?.workspaceId) {
++    if (proxyMembership !== undefined) {
++      return deny(
++        403,
++        'WORKSPACE_PROJECT_PERMISSION_DENIED',
++        `workspace project ${options.mode} is not allowed`,
++      );
++    }
++    return true;
++  }
++  if (proxyMembership !== undefined && !req?.headers?.['x-od-workspace-id']) {
++    if (!proxyMembership || !req?.headers) {
++      return deny(
++        403,
++        'WORKSPACE_PROJECT_PERMISSION_DENIED',
++        `workspace project ${options.mode} is not allowed`,
++      );
++    }
++    applyWorkspaceIdentityHeaders(req, proxyMembership);
++  }
+ 
+   const scopedRequest = options.mode === 'read' && options.allowNavigationQuery
+     ? requestWithWorkspaceNavigationScope(req)
+diff --git a/apps/daemon/src/collab/workspace-context.ts b/apps/daemon/src/collab/workspace-context.ts
+index 2e3f598a90..65b3d1dc13 100644
+--- a/apps/daemon/src/collab/workspace-context.ts
++++ b/apps/daemon/src/collab/workspace-context.ts
+@@ -203,6 +203,10 @@ export function resolveWorkspaceSettingsUrl(
+   // workspace another device left active, so every console link pins the id.
+   // The low-cardinality source marker lets Vela attribute the resulting
+   // Workspace management outcomes without carrying user-entered values.
++  // Self-hosted override (e.g. the proxy-mode /team-admin page) wins over any
++  // Vela console origin.
++  const selfHosted = env.OD_WORKSPACE_SETTINGS_URL?.trim();
++  if (selfHosted) return withWorkspaceDeepLink(selfHosted, workspaceId);
+   const base = resolveEffectiveVelaConsoleOrigin(env, configuredEnv);
+   const hasRuntimeProfile = Boolean(
+     configuredEnv.OPEN_DESIGN_AMR_PROFILE?.trim() || configuredEnv.VELA_PROFILE?.trim(),
+diff --git a/apps/daemon/src/http/proxy-identity.ts b/apps/daemon/src/http/proxy-identity.ts
+new file mode 100644
+index 0000000000..488f08891e
+--- /dev/null
++++ b/apps/daemon/src/http/proxy-identity.ts
+@@ -0,0 +1,234 @@
++// Proxy-asserted identity for multi-user self-hosted deployments.
++//
++// Enabled with OD_PROXY_AUTH=1. The daemon must then be reachable ONLY through
++// an authenticating reverse proxy (e.g. oauth2-proxy) that sets a trusted email
++// header (OD_PROXY_EMAIL_HEADER, default `x-forwarded-email`) and strips any
++// client-supplied copy. For every non-loopback request this middleware:
++//
++//   1. requires that email (401 otherwise),
++//   2. discards every client-supplied `x-od-workspace-*` / `x-od-app-user-id`
++//      header, and
++//   3. re-derives them from the local team directory (`collab/local-teams.ts`)
++//      for the workspace the client asked for — 403 when the caller is not a
++//      member.
++//
++// The rest of the daemon keeps trusting those headers exactly as it does in
++// local mode, so the existing project visibility gate enforces Personal /
++// Team-private / Team-shared access without further changes.
++//
++// Loopback peers are left untouched: they are the daemon's own agent
++// subprocesses and the container health check. Never place the reverse proxy
++// in the daemon's network namespace (e.g. `network_mode: host` or a sidecar
++// sharing the pod network), or proxied traffic would look like loopback.
++
++import { AsyncLocalStorage } from 'node:async_hooks';
++import type { NextFunction, Request, Response } from 'express';
++import type { WorkspaceDirectoryItem } from '@open-design/contracts';
++import { isTruthyEnvFlag } from '../api-token-auth.js';
++import {
++  normalizeEmail,
++  personalWorkspaceIdForEmail,
++  type LocalTeamStore,
++} from '../collab/local-teams.js';
++
++const DEFAULT_EMAIL_HEADER = 'x-forwarded-email';
++const WORKSPACE_HEADER_PREFIX = 'x-od-workspace-';
++const APP_USER_HEADER = 'x-od-app-user-id';
++const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
++const OPEN_PROBE_PATHS = new Set([
++  '/health',
++  '/api/health',
++  '/ready',
++  '/api/ready',
++  '/version',
++  '/api/version',
++]);
++
++interface ProxyIdentity {
++  email: string;
++}
++
++const identityStorage = new AsyncLocalStorage<ProxyIdentity>();
++let activeTeamStore: LocalTeamStore | null = null;
++
++/** Registered once at startup so deep authorization seams can resolve membership. */
++export function setProxyTeamStore(store: LocalTeamStore | null): void {
++  activeTeamStore = store;
++}
++
++/**
++ * The current proxy user's directory entry for `workspaceId`.
++ * `undefined` = no proxy identity on this request (proxy mode off or loopback);
++ * `null` = authenticated but not a member.
++ */
++export function proxyMembershipFor(workspaceId: string): WorkspaceDirectoryItem | null | undefined {
++  if (!isProxyAuthEnabled()) return undefined;
++  const email = currentProxyEmail();
++  if (!email) return undefined;
++  return activeTeamStore?.membershipFor(email, workspaceId) ?? null;
++}
++
++export function isProxyAuthEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
++  return isTruthyEnvFlag(env.OD_PROXY_AUTH);
++}
++
++export function proxyEmailHeaderName(env: NodeJS.ProcessEnv = process.env): string {
++  return (env.OD_PROXY_EMAIL_HEADER?.trim() || DEFAULT_EMAIL_HEADER).toLowerCase();
++}
++
++/** The authenticated email for the current request, or null (loopback / off). */
++export function currentProxyEmail(): string | null {
++  return identityStorage.getStore()?.email ?? null;
++}
++
++export function proxyAdminEmails(env: NodeJS.ProcessEnv = process.env): Set<string> {
++  return new Set(
++    String(env.OD_ADMIN_EMAILS ?? '')
++      .split(',')
++      .map((value) => normalizeEmail(value))
++      .filter((value): value is string => Boolean(value)),
++  );
++}
++
++/**
++ * True when the request may change daemon-wide settings. Loopback callers
++ * (agent subprocesses, local CLI) and proxy mode being off keep upstream
++ * behavior; otherwise only OD_ADMIN_EMAILS may write.
++ */
++export function mayWriteGlobalSettings(env: NodeJS.ProcessEnv = process.env): boolean {
++  if (!isProxyAuthEnabled(env)) return true;
++  const email = currentProxyEmail();
++  if (!email) return true;
++  return proxyAdminEmails(env).has(email);
++}
++
++/** Express guard for daemon-wide settings writes. */
++export function requireGlobalSettingsWriter(req: Request, res: Response, next: NextFunction) {
++  if (SAFE_METHODS.has(req.method) || mayWriteGlobalSettings()) return next();
++  res.status(403).json({
++    error: {
++      code: 'ADMIN_REQUIRED',
++      message: 'only OpenDesign administrators (OD_ADMIN_EMAILS) can change shared settings',
++    },
++  });
++}
++
++export function applyWorkspaceIdentityHeaders(req: Request, item: WorkspaceDirectoryItem): void {
++  const headers = req.headers;
++  headers['x-od-workspace-id'] = item.workspaceId;
++  headers['x-od-workspace-member-id'] = item.workspaceMemberId;
++  headers['x-od-workspace-type'] = item.workspaceType;
++  headers['x-od-workspace-role'] = item.role;
++  headers['x-od-workspace-member-status'] = item.memberStatus;
++  headers['x-od-workspace-lifecycle-state'] = item.lifecycleState;
++  headers['x-od-workspace-can-share-projects'] = 'true';
++  headers['x-od-workspace-can-write-synced-files'] = 'true';
++}
++
++function stripClientIdentityHeaders(req: Request): void {
++  for (const name of Object.keys(req.headers)) {
++    const lower = name.toLowerCase();
++    if (lower.startsWith(WORKSPACE_HEADER_PREFIX) || lower === APP_USER_HEADER) {
++      delete req.headers[name];
++    }
++  }
++}
++
++/** Rewrite EventSource navigation params so they match the verified headers. */
++function rewriteNavigationQuery(req: Request, item: WorkspaceDirectoryItem): void {
++  const url = new URL(req.url, 'http://daemon.local');
++  if (!url.searchParams.has('workspaceId') && !url.searchParams.has('workspaceMemberId')) return;
++  url.searchParams.set('workspaceId', item.workspaceId);
++  url.searchParams.set('workspaceMemberId', item.workspaceMemberId);
++  req.url = `${url.pathname}${url.search}`;
++}
++
++function claimedWorkspaceId(req: Request): string | null {
++  const header = req.headers['x-od-workspace-id'];
++  const fromHeader = Array.isArray(header) ? header[0] : header;
++  if (typeof fromHeader === 'string' && fromHeader.trim()) return fromHeader.trim();
++  const query = req.query as Record<string, unknown> | undefined;
++  const fromQuery = query?.workspaceId;
++  if (typeof fromQuery === 'string' && fromQuery.trim()) return fromQuery.trim();
++  return null;
++}
++
++export interface ProxyIdentityMiddlewareOptions {
++  /** Lazy: the daemon opens SQLite after middleware registration. */
++  getStore: () => LocalTeamStore | null;
++  isLoopbackPeer: (address: string | undefined) => boolean;
++  /**
++   * Project preview asset paths. Sandboxed preview iframes send no cookies, so
++   * the proxy lets these paths through unauthenticated (skip-auth route) and
++   * the daemon accepts them only with a valid server-minted preview scope:
++   * 'valid' = scoped asset, 'invalid' = preview path with a bad scope (always
++   * rejected — never fall back to a possibly client-supplied email header),
++   * null = not a preview path.
++   */
++  classifyPreviewRequest?: (req: Request) => 'valid' | 'invalid' | null;
++  env?: NodeJS.ProcessEnv;
++}
++
++export function createProxyIdentityMiddleware(options: ProxyIdentityMiddlewareOptions) {
++  const env = options.env ?? process.env;
++  const headerName = proxyEmailHeaderName(env);
++
++  return function proxyIdentity(req: Request, res: Response, next: NextFunction) {
++    if (options.isLoopbackPeer(req.socket?.remoteAddress)) return next();
++    if (OPEN_PROBE_PATHS.has(req.path)) return next();
++    const preview = options.classifyPreviewRequest?.(req) ?? null;
++    if (preview === 'valid' && (req.method === 'GET' || req.method === 'HEAD')) {
++      stripClientIdentityHeaders(req);
++      return next();
++    }
++    if (preview !== null) {
++      res.status(401).json({
++        error: { code: 'PREVIEW_SCOPE_INVALID', message: 'preview link expired; reload the project' },
++      });
++      return;
++    }
++
++    const rawEmail = req.headers[headerName];
++    const email = normalizeEmail(Array.isArray(rawEmail) ? rawEmail[0] : rawEmail);
++    if (!email) {
++      res.status(401).json({
++        error: {
++          code: 'PROXY_IDENTITY_REQUIRED',
++          message: 'request did not pass through the authenticating proxy',
++        },
++      });
++      return;
++    }
++
++    const store = options.getStore();
++    if (!store) {
++      res.status(503).json({ error: { code: 'NOT_READY', message: 'daemon is starting' } });
++      return;
++    }
++    const claimed = claimedWorkspaceId(req);
++    stripClientIdentityHeaders(req);
++    req.headers[APP_USER_HEADER] = email;
++
++    let item: WorkspaceDirectoryItem | null = null;
++    if (claimed) {
++      item = store.membershipFor(email, claimed);
++      if (!item) {
++        res.status(403).json({
++          error: 'WORKSPACE_ACCESS_DENIED',
++          message: 'the requested workspace is not available to this member',
++        });
++        return;
++      }
++    } else if (!SAFE_METHODS.has(req.method)) {
++      // Unscoped writes (e.g. create project without a workspace header) land
++      // in the caller's Personal workspace instead of an unowned global bucket.
++      item = store.membershipFor(email, personalWorkspaceIdForEmail(email));
++    }
++    if (item) {
++      applyWorkspaceIdentityHeaders(req, item);
++      rewriteNavigationQuery(req, item);
++    }
++
++    identityStorage.run({ email }, () => next());
++  };
++}
+diff --git a/apps/daemon/src/memory.ts b/apps/daemon/src/memory.ts
+index 644c8cb77a..7f76ff8cb3 100644
+--- a/apps/daemon/src/memory.ts
++++ b/apps/daemon/src/memory.ts
+@@ -25,6 +25,7 @@ import path from 'node:path';
+ import { EventEmitter } from 'node:events';
+ import { MEMORY_TYPES, PROFILE_MEMORY_ID, parseFormAnswers } from '@open-design/contracts';
+ import { parseFrontmatter } from './design-systems/frontmatter.js';
++import { isProxyAuthEnabled } from './http/proxy-identity.js';
+ // Imported lazily through the memory-extractions module by the call
+ // sites below so a future test-only build of memory.ts that stubs the
+ // store can still tree-shake the ring buffer. We use a static import
+@@ -196,7 +197,20 @@ function normalizeExtractionPatch(input) {
+   return out;
+ }
+ 
++// Proxy-authenticated multi-user mode: memory is one daemon-wide store, so
++// facts from one user's private chats would be injected into everyone's
++// prompts. Keep every memory hook off there.
++const PROXY_MODE_MEMORY_CONFIG = Object.freeze({
++  enabled: false,
++  chatExtractionEnabled: false,
++  profileEnabled: false,
++  rewriteEnabled: false,
++  verifyEnabled: false,
++  extraction: null,
++});
++
+ export async function readMemoryConfig(dataDir) {
++  if (isProxyAuthEnabled()) return { ...PROXY_MODE_MEMORY_CONFIG };
+   try {
+     const raw = await fsp.readFile(configPath(dataDir), 'utf8');
+     const parsed = JSON.parse(raw);
+diff --git a/apps/daemon/src/routes/collab-context.ts b/apps/daemon/src/routes/collab-context.ts
+index e07916b7a3..806aab61bd 100644
+--- a/apps/daemon/src/routes/collab-context.ts
++++ b/apps/daemon/src/routes/collab-context.ts
+@@ -184,6 +184,17 @@ export interface RegisterCollabContextRoutesDeps {
+   listMembers?: (
+     context: WorkspaceCollabContext,
+   ) => Promise<CollabCloudMemberDirectoryEntry[]>;
++  /**
++   * Proxy-authenticated self-hosted mode (OD_PROXY_AUTH): invites add members
++   * to the local team directory immediately instead of going through Vela, and
++   * the daemon-global dev workspace context cannot be overwritten by a user.
++   */
++  localTeams?: {
++    invite(
++      workspaceId: string,
++      items: Array<{ email: string; role: string }>,
++    ): WorkspaceInviteCreateResult[];
++  };
+   /**
+    * Client-local restart default. Data-plane routes never use it as authority;
+    * each tab continues to carry its exact Workspace and member identity.
+@@ -446,6 +457,13 @@ export function registerCollabContextRoutes(app: Express, deps: RegisterCollabCo
+       return res.status(403).json({ error: 'forbidden' });
+     }
+ 
++    if (deps.localTeams) {
++      const body: WorkspaceInviteCreateResponse = {
++        results: deps.localTeams.invite(workspaceId, items),
++      };
++      return res.json(body);
++    }
++
+     const results: WorkspaceInviteCreateResult[] = [];
+     for (const [index, item] of items.entries()) {
+       const outcome = await createInvite({ ...item, workspaceId }, requestEnv);
+@@ -1139,6 +1157,9 @@ export function registerCollabContextRoutes(app: Express, deps: RegisterCollabCo
+   // Dev/demo seam: override the in-memory context. A real B-backed provider does
+   // not expose `set`, so this 404s in production instead of spoofing identity.
+   app.put('/api/workspace/context', (req, res) => {
++    if (deps.localTeams) {
++      return res.status(403).json({ error: 'workspace context is managed by the identity proxy' });
++    }
+     if (!workspaceContext.set) {
+       return res.status(404).json({ error: 'workspace context is not settable' });
+     }
+diff --git a/apps/daemon/src/routes/local-teams-page.ts b/apps/daemon/src/routes/local-teams-page.ts
+new file mode 100644
+index 0000000000..3eeab8a676
+--- /dev/null
++++ b/apps/daemon/src/routes/local-teams-page.ts
+@@ -0,0 +1,190 @@
++// Self-contained team management page served at /team-admin in
++// proxy-authenticated mode. Plain HTML + inline script so it needs no web
++// build changes; it talks only to the same-origin /api/local-teams routes.
++
++export const TEAM_ADMIN_PAGE_HTML = `<!doctype html>
++<html lang="en">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>OpenDesign Teams</title>
++<style>
++  :root { --bg:#f7f7f5; --panel:#fff; --text:#1d1d1b; --muted:#6b6b66; --line:#e3e3de; --accent:#2f5bea; --danger:#c0392b; }
++  @media (prefers-color-scheme: dark) { :root { --bg:#151514; --panel:#1f1f1d; --text:#ececea; --muted:#a2a29c; --line:#33332f; --accent:#7d9bff; --danger:#ff7b6b; } }
++  * { box-sizing: border-box; }
++  [hidden] { display: none !important; }
++  body { margin:0; font:14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
++  main { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
++  header { display:flex; justify-content:space-between; align-items:baseline; gap:12px; flex-wrap:wrap; margin-bottom: 20px; }
++  h1 { font-size: 20px; margin: 0; }
++  h2 { font-size: 15px; margin: 0 0 12px; }
++  a { color: var(--accent); }
++  .muted { color: var(--muted); }
++  .grid { display:grid; grid-template-columns: 260px 1fr; gap: 16px; }
++  @media (max-width: 680px) { .grid { grid-template-columns: 1fr; } }
++  section { background: var(--panel); border:1px solid var(--line); border-radius: 10px; padding: 16px; }
++  ul { list-style:none; margin:0; padding:0; }
++  .team { width:100%; text-align:left; background:none; border:1px solid transparent; border-radius:8px; padding:8px 10px; color:inherit; cursor:pointer; font:inherit; }
++  .team[aria-current="true"] { border-color: var(--accent); }
++  .team small { display:block; color: var(--muted); }
++  form { display:flex; gap:8px; flex-wrap:wrap; margin-top: 12px; }
++  input, select { font:inherit; padding:6px 8px; border:1px solid var(--line); border-radius:6px; background:var(--bg); color:inherit; min-width:0; }
++  input[type=email], input[type=text] { flex: 1 1 180px; }
++  button.primary, button.danger { font:inherit; padding:6px 12px; border-radius:6px; border:1px solid var(--accent); background:var(--accent); color:#fff; cursor:pointer; }
++  button.danger { background:none; color: var(--danger); border-color: var(--line); padding:4px 10px; }
++  table { width:100%; border-collapse: collapse; }
++  td, th { text-align:left; padding:8px 4px; border-bottom:1px solid var(--line); overflow-wrap:anywhere; }
++  th { font-weight:600; color: var(--muted); font-size: 12px; }
++  #status { min-height: 1.5em; margin: 8px 0 0; }
++  #status.error { color: var(--danger); }
++</style>
++</head>
++<body>
++<main>
++  <header>
++    <h1>Teams</h1>
++    <span class="muted">Signed in as <strong id="me">…</strong> · <a href="/">Back to OpenDesign</a></span>
++  </header>
++  <div class="grid">
++    <section aria-labelledby="teams-h">
++      <h2 id="teams-h">Your teams</h2>
++      <ul id="teams"></ul>
++      <form id="create">
++        <input type="text" id="team-name" placeholder="New team name" maxlength="120" required aria-label="New team name">
++        <button class="primary" type="submit">Create</button>
++      </form>
++    </section>
++    <section aria-labelledby="members-h">
++      <h2 id="members-h">Members</h2>
++      <p id="empty" class="muted">Select or create a team.</p>
++      <div id="detail" hidden>
++        <table>
++          <thead><tr><th>Email</th><th>Role</th><th></th></tr></thead>
++          <tbody id="members"></tbody>
++        </table>
++        <form id="add" hidden>
++          <input type="email" id="add-email" placeholder="colleague@example.com" required aria-label="Email">
++          <select id="add-role" aria-label="Role"><option value="member">Member</option><option value="admin">Admin</option></select>
++          <button class="primary" type="submit">Add</button>
++        </form>
++        <p class="muted">Added colleagues get access immediately. They see the team in OpenDesign's workspace switcher after their next page load.</p>
++      </div>
++      <p id="status" role="status"></p>
++    </section>
++  </div>
++</main>
++<script>
++(() => {
++  const $ = (id) => document.getElementById(id);
++  const params = new URLSearchParams(location.search);
++  let me = '';
++  let selected = params.get('workspaceId') || null;
++  let myRole = 'member';
++
++  function status(text, isError) {
++    $('status').textContent = text || '';
++    $('status').className = isError ? 'error' : '';
++  }
++  async function api(path, options) {
++    const res = await fetch(path, Object.assign({ headers: { 'content-type': 'application/json' }, credentials: 'same-origin' }, options || {}));
++    const body = await res.json().catch(() => ({}));
++    if (!res.ok) throw new Error((body && body.error && (body.error.message || body.error)) || ('HTTP ' + res.status));
++    return body;
++  }
++  function el(tag, props, children) {
++    const node = document.createElement(tag);
++    Object.assign(node, props || {});
++    (children || []).forEach((child) => node.append(child));
++    return node;
++  }
++
++  async function loadTeams() {
++    const data = await api('/api/local-teams');
++    me = data.me;
++    $('me').textContent = me;
++    const list = $('teams');
++    list.replaceChildren();
++    if (!data.teams.length) list.append(el('li', { className: 'muted', textContent: 'No teams yet.' }));
++    data.teams.forEach((team) => {
++      const button = el('button', { className: 'team', type: 'button' }, [
++        team.name,
++        el('small', { textContent: team.role + ' · ' + team.memberCount + (team.memberCount === 1 ? ' member' : ' members') }),
++      ]);
++      button.setAttribute('aria-current', String(team.id === selected));
++      button.addEventListener('click', () => { selected = team.id; history.replaceState(null, '', '?workspaceId=' + encodeURIComponent(team.id)); render(); });
++      list.append(el('li', {}, [button]));
++    });
++    if (selected && !data.teams.some((team) => team.id === selected)) selected = null;
++  }
++
++  async function loadMembers() {
++    if (!selected) { $('detail').hidden = true; $('empty').hidden = false; return; }
++    const data = await api('/api/local-teams/' + encodeURIComponent(selected) + '/members');
++    myRole = data.role;
++    const manager = myRole === 'owner' || myRole === 'admin';
++    $('empty').hidden = true;
++    $('detail').hidden = false;
++    $('add').hidden = !manager;
++    $('add-role').querySelector('option[value=admin]').disabled = myRole !== 'owner';
++    const tbody = $('members');
++    tbody.replaceChildren();
++    data.members.forEach((member) => {
++      const self = member.email === me;
++      const canRemove = self || (manager && (member.role !== 'owner' || myRole === 'owner'));
++      const action = el('td');
++      if (canRemove) {
++        const remove = el('button', { className: 'danger', type: 'button', textContent: self ? 'Leave' : 'Remove' });
++        remove.addEventListener('click', async () => {
++          if (!confirm(self ? 'Leave this team?' : 'Remove ' + member.email + '?')) return;
++          try {
++            await api('/api/local-teams/' + encodeURIComponent(selected) + '/members/' + encodeURIComponent(member.email), { method: 'DELETE' });
++            if (self) selected = null;
++            status(self ? 'You left the team.' : 'Removed ' + member.email + '.');
++            await render();
++          } catch (error) { status(error.message, true); }
++        });
++        action.append(remove);
++      }
++      tbody.append(el('tr', {}, [el('td', { textContent: member.email + (self ? ' (you)' : '') }), el('td', { textContent: member.role }), action]));
++    });
++  }
++
++  async function render() {
++    try { await loadTeams(); await loadMembers(); } catch (error) { status(error.message, true); }
++  }
++
++  $('create').addEventListener('submit', async (event) => {
++    event.preventDefault();
++    try {
++      const data = await api('/api/local-teams', { method: 'POST', body: JSON.stringify({ name: $('team-name').value }) });
++      $('team-name').value = '';
++      selected = data.team.id;
++      history.replaceState(null, '', '?workspaceId=' + encodeURIComponent(selected));
++      status('Team created. Add members below, then reload OpenDesign to switch to it.');
++      await render();
++    } catch (error) { status(error.message, true); }
++  });
++
++  $('add').addEventListener('submit', async (event) => {
++    event.preventDefault();
++    try {
++      const data = await api('/api/local-teams/' + encodeURIComponent(selected) + '/members', {
++        method: 'POST',
++        body: JSON.stringify({ email: $('add-email').value, role: $('add-role').value }),
++      });
++      const result = data.results[0];
++      if (result && result.ok) { $('add-email').value = ''; status('Added ' + result.email + '.'); }
++      else status('Could not add: ' + ((result && result.error) || 'unknown error'), true);
++      await render();
++    } catch (error) { status(error.message, true); }
++  });
++
++  render().then(() => {
++    if (params.get('workspace') === 'create') $('team-name').focus();
++    else if (params.get('invite') && !$('add').hidden) $('add-email').focus();
++  });
++})();
++</script>
++</body>
++</html>
++`;
+diff --git a/apps/daemon/src/routes/local-teams.ts b/apps/daemon/src/routes/local-teams.ts
+new file mode 100644
+index 0000000000..97938fb1c3
+--- /dev/null
++++ b/apps/daemon/src/routes/local-teams.ts
+@@ -0,0 +1,104 @@
++// Team management for proxy-authenticated self-hosted deployments
++// (OD_PROXY_AUTH=1). Replaces the Vela web console that upstream links to for
++// "Create team" / "Manage members": `OD_WORKSPACE_SETTINGS_URL` points the
++// existing web entries at the `/team-admin` page served here.
++
++import type { Express, Request, Response } from 'express';
++import { LocalTeamError, type LocalTeamStore } from '../collab/local-teams.js';
++import { currentProxyEmail } from '../http/proxy-identity.js';
++import { TEAM_ADMIN_PAGE_HTML } from './local-teams-page.js';
++
++export interface LocalTeamRoutesDeps {
++  getStore: () => LocalTeamStore | null;
++  /** Notify open web clients that a workspace's membership changed. */
++  onMembershipChanged?: (workspaceId: string) => void;
++}
++
++function sendError(res: Response, status: number, code: string, message: string) {
++  res.status(status).json({ error: { code, message } });
++}
++
++export function registerLocalTeamRoutes(app: Express, deps: LocalTeamRoutesDeps): void {
++  const withCaller = (
++    handler: (store: LocalTeamStore, email: string, req: Request, res: Response) => void,
++  ) => (req: Request, res: Response) => {
++    const store = deps.getStore();
++    const email = currentProxyEmail();
++    if (!store || !email) {
++      return sendError(res, 401, 'PROXY_IDENTITY_REQUIRED', 'sign in through the identity proxy');
++    }
++    try {
++      handler(store, email, req, res);
++    } catch (error) {
++      if (error instanceof LocalTeamError) {
++        return sendError(res, error.status, error.code, error.message);
++      }
++      return sendError(res, 500, 'INTERNAL_ERROR', String(error));
++    }
++  };
++
++  const requireMember = (store: LocalTeamStore, email: string, teamId: string) => {
++    const membership = store.membershipFor(email, teamId);
++    if (!membership || membership.workspaceType !== 'team') {
++      throw new LocalTeamError(404, 'TEAM_NOT_FOUND', 'team not found');
++    }
++    return membership;
++  };
++
++  // The web client derives sub-pages from the settings URL
++  // (/team-admin/team, /team-admin/dashboard?workspace=create, ...); every one
++  // renders the same page.
++  const sendPage = (_req: Request, res: Response) => {
++    res
++      .status(200)
++      .type('html')
++      .set('Cache-Control', 'no-store')
++      .set('Content-Security-Policy', "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'")
++      .send(TEAM_ADMIN_PAGE_HTML);
++  };
++  app.get('/team-admin', sendPage);
++  app.get('/team-admin/*rest', sendPage);
++
++  app.get('/api/local-teams', withCaller((store, email, _req, res) => {
++    res.json({ me: email, teams: store.listTeams(email) });
++  }));
++
++  app.post('/api/local-teams', withCaller((store, email, req, res) => {
++    const team = store.createTeam(email, (req.body as { name?: unknown } | null)?.name);
++    res.status(201).json({ team });
++  }));
++
++  app.patch('/api/local-teams/:teamId', withCaller((store, email, req, res) => {
++    const teamId = String(req.params.teamId);
++    store.renameTeam(email, teamId, (req.body as { name?: unknown } | null)?.name);
++    deps.onMembershipChanged?.(teamId);
++    res.json({ ok: true });
++  }));
++
++  app.get('/api/local-teams/:teamId/members', withCaller((store, email, req, res) => {
++    const teamId = String(req.params.teamId);
++    const membership = requireMember(store, email, teamId);
++    res.json({ role: membership.role, members: store.listMembers(teamId) });
++  }));
++
++  app.post('/api/local-teams/:teamId/members', withCaller((store, email, req, res) => {
++    const teamId = String(req.params.teamId);
++    const body = req.body as { email?: unknown; role?: unknown; members?: unknown } | null;
++    const items = Array.isArray(body?.members)
++      ? (body!.members as Array<{ email?: unknown; role?: unknown }>)
++      : [{ email: body?.email, role: body?.role }];
++    const results = store.addMembers(email, teamId, items.map((item) => ({
++      email: item?.email,
++      role: item?.role,
++    })));
++    if (results.some((result) => result.ok)) deps.onMembershipChanged?.(teamId);
++    res.json({ results });
++  }));
++
++  app.delete('/api/local-teams/:teamId/members/:email', withCaller((store, email, req, res) => {
++    const teamId = String(req.params.teamId);
++    store.removeMember(email, teamId, String(req.params.email));
++    deps.onMembershipChanged?.(teamId);
++    res.json({ ok: true });
++  }));
++}
+diff --git a/apps/daemon/src/routes/project/index.ts b/apps/daemon/src/routes/project/index.ts
+index ed6b253da3..9cee74d825 100644
+--- a/apps/daemon/src/routes/project/index.ts
++++ b/apps/daemon/src/routes/project/index.ts
+@@ -8,6 +8,7 @@ import type { ProjectDeleteResponse } from '@open-design/contracts';
+ import { publicFileMutationHandler } from '../public-file-mutation-handler.js';
+ import { createPublicFileMutations, type PublicFileMutations } from '../../collab/public-file-mutations.js';
+ import { rm } from 'node:fs/promises';
++import { currentProxyEmail, isProxyAuthEnabled } from '../../http/proxy-identity.js';
+ import path from 'node:path';
+ import { load } from 'cheerio';
+ import {
+@@ -3359,6 +3360,11 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
+   });
+ 
+   app.get('/api/projects', async (_req, res) => {
++    // Proxy-authenticated multi-user mode has no shared unbound catalog: every
++    // user's projects are listed through their workspace-scoped endpoint.
++    if (isProxyAuthEnabled() && currentProxyEmail()) {
++      return res.json({ projects: [] });
++    }
+     try {
+       const locations = await configuredProjectLocations();
+       const latestRunStatuses = listLatestProjectRunStatuses(db);
+diff --git a/apps/daemon/src/server.ts b/apps/daemon/src/server.ts
+index c968d4edc5..65e50f7c59 100644
+--- a/apps/daemon/src/server.ts
++++ b/apps/daemon/src/server.ts
+@@ -1221,6 +1221,15 @@ import {
+   isApiAuthDisabled,
+   isApiTokenMiddlewareEnabled,
+ } from './api-token-auth.js';
++import {
++  createProxyIdentityMiddleware,
++  currentProxyEmail,
++  isProxyAuthEnabled,
++  requireGlobalSettingsWriter,
++  setProxyTeamStore,
++} from './http/proxy-identity.js';
++import { createLocalTeamStore, type LocalTeamStore } from './collab/local-teams.js';
++import { registerLocalTeamRoutes } from './routes/local-teams.js';
+ import { createOpenDesignPublicMetadataService } from './services/open-design-public-metadata.js';
+ import { createWhatsNewService } from './services/whats-new.js';
+ import { execCommandViaLoginShell } from './services/login-shell.js';
+@@ -3246,10 +3255,13 @@ export async function startServer({
+   // are exempted so the desktop UI keeps working).
+   const apiToken = apiTokenFromEnv();
+   const apiAuthDisabled = isApiAuthDisabled();
+-  const apiTokenAuthEnabled = apiToken.length > 0 && !apiAuthDisabled;
++  // OD_PROXY_AUTH: an authenticating reverse proxy asserts the user's email;
++  // the proxy identity middleware (below) replaces the shared-token gate.
++  const proxyAuthEnabled = isProxyAuthEnabled();
++  const apiTokenAuthEnabled = apiToken.length > 0 && !apiAuthDisabled && !proxyAuthEnabled;
+   const isApiTokenAuthorization = (authorization: string | undefined): boolean =>
+     apiTokenAuthEnabled && apiTokenAuthorizationMatches(authorization, apiToken);
+-  if (!isLoopbackHostname(host) && apiToken.length === 0 && !apiAuthDisabled) {
++  if (!isLoopbackHostname(host) && apiToken.length === 0 && !apiAuthDisabled && !proxyAuthEnabled) {
+     throw new Error(
+       `OD_BIND_HOST=${host} requires OD_API_TOKEN to be set. ` +
+       `Generate one with \`openssl rand -hex 32\` and re-launch. ` +
+@@ -3303,6 +3315,36 @@ export async function startServer({
+   app.use(CHAT_SCROLL_FORENSICS_PATH, chatScrollForensicsBodyParser);
+   app.use(express.json({ limit: '4mb', verify: captureJsonBodySize }));
+   const projectPreviewScopes = createProjectPreviewScopeRegistry();
++  // Proxy-authenticated multi-user mode. SQLite opens later in startup, so the
++  // team store is bound lazily; requests only arrive after listen().
++  let localTeamStore: LocalTeamStore | null = null;
++  if (proxyAuthEnabled) {
++    app.use(createProxyIdentityMiddleware({
++      getStore: () => localTeamStore,
++      isLoopbackPeer: (address) => isLoopbackPeerAddress(address),
++      classifyPreviewRequest: (req) => {
++        if (!req.path.startsWith('/api/')) return null;
++        const previewAsset = parseProjectPreviewAssetPath(req.path.slice('/api'.length));
++        if (!previewAsset) return null;
++        return projectPreviewScopes.validate(previewAsset.projectId, previewAsset.scope)
++          ? 'valid'
++          : 'invalid';
++      },
++    }));
++    // Daemon-wide settings (agent/API keys, MCP, connectors, memory, project
++    // locations) are shared by every user: only OD_ADMIN_EMAILS may change them.
++    for (const prefix of [
++      '/api/app-config',
++      '/api/media/config',
++      '/api/mcp',
++      '/api/connectors',
++      '/api/integrations',
++      '/api/memory',
++      '/api/project-locations',
++    ]) {
++      app.use(prefix, requireGlobalSettingsWriter);
++    }
++  }
+ 
+   // Plan §3.K1 — API-token middleware.
+   //
+@@ -3584,6 +3626,10 @@ export async function startServer({
+     previousLogPath: resolveDaemonPreviousLogPath(runtime),
+   });
+   const db = openDatabase(PROJECT_ROOT, { dataDir: RUNTIME_DATA_DIR });
++  if (proxyAuthEnabled) {
++    localTeamStore = createLocalTeamStore(db);
++    setProxyTeamStore(localTeamStore);
++  }
+   daemonHealth?.setStorageProbe(() => readSqlitePageStats({ db, file: db.name }));
+   const amrTerminalReportOutbox = createAmrTerminalReportOutboxStore(db);
+   // P0-24 N10: notices for turns that end while this process runs (never replayed).
+@@ -3990,11 +4036,25 @@ export async function startServer({
+       void revokedWorkspaceRuns?.observeDirectory(proof.actorKey, result.items);
+     },
+   });
+-  const fetchWorkspaceDirectory = workspaceDirectoryAuthority.read;
+-  const fetchFreshMutationWorkspaceDirectory =
+-    workspaceDirectoryAuthority.fresh;
+-  const fetchFreshBackgroundWorkspaceDirectory =
+-    workspaceDirectoryAuthority.backgroundFresh;
++  // Proxy mode: the membership directory is the local team store, resolved
++  // per request for the proxy-asserted user. Never use the broker's shared
++  // lease here — it is keyed to one daemon-wide Vela session, not to a user.
++  const fetchLocalTeamDirectory = async () => {
++    const email = currentProxyEmail();
++    return {
++      ok: true,
++      items: email && localTeamStore ? localTeamStore.directoryFor(email) : [],
++    };
++  };
++  const fetchWorkspaceDirectory = proxyAuthEnabled
++    ? fetchLocalTeamDirectory
++    : workspaceDirectoryAuthority.read;
++  const fetchFreshMutationWorkspaceDirectory = proxyAuthEnabled
++    ? fetchLocalTeamDirectory
++    : workspaceDirectoryAuthority.fresh;
++  const fetchFreshBackgroundWorkspaceDirectory = proxyAuthEnabled
++    ? fetchLocalTeamDirectory
++    : workspaceDirectoryAuthority.backgroundFresh;
+   let workspaceHubSubscriptions: WorkspaceHubSubscriptionManager | null = null;
+   const quotaHealthyConnections = new Set<string>();
+   const verifyExplicitWorkspaceRequestContext = async (input: {
+@@ -4046,17 +4106,33 @@ export async function startServer({
+         message: 'the requested workspace is not available to this member',
+       };
+     }
++    // Proxy mode: headers were already re-derived from the local directory by
++    // the identity middleware; reuse the real team name and user email.
++    const proxyEmail = proxyAuthEnabled ? currentProxyEmail() : null;
++    const proxyItem = proxyEmail
++      ? localTeamStore?.membershipFor(proxyEmail, claimed.workspaceId) ?? null
++      : null;
++    if (proxyEmail && !proxyItem) {
++      return {
++        ok: false as const,
++        status: 403 as const,
++        code: 'WORKSPACE_ACCESS_DENIED' as const,
++        message: 'the requested workspace is not available to this member',
++      };
++    }
++    const context = workspaceContextFromDirectoryItem(proxyItem ?? {
++      workspaceId: claimed.workspaceId,
++      workspaceName: claimed.workspaceId,
++      workspaceType: claimed.workspaceType,
++      workspaceMemberId: claimed.workspaceMemberId,
++      role: claimed.role,
++      memberStatus: claimed.memberStatus,
++      lifecycleState: claimed.lifecycleState,
++    }, configuredAmrEnv());
++    if (proxyEmail) context.displayName = proxyEmail;
+     return {
+       ok: true as const,
+-      context: workspaceContextFromDirectoryItem({
+-        workspaceId: claimed.workspaceId,
+-        workspaceName: claimed.workspaceId,
+-        workspaceType: claimed.workspaceType,
+-        workspaceMemberId: claimed.workspaceMemberId,
+-        role: claimed.role,
+-        memberStatus: claimed.memberStatus,
+-        lifecycleState: claimed.lifecycleState,
+-      }, configuredAmrEnv()),
++      context,
+     };
+   };
+   const verifyWorkspaceReadAuthority = (req: unknown) =>
+@@ -4944,6 +5020,11 @@ export async function startServer({
+   const teamProjectsForDisplay = async (
+     context: WorkspaceCollabContext | null,
+   ): Promise<TeamProject[]> => {
++    if (proxyAuthEnabled) {
++      return context?.workspaceType === 'team' && localTeamStore
++        ? localTeamStore.listTeamProjects(context.workspaceId)
++        : [];
++    }
+     const scope = teamProjectsDisplayScopeFromContext(context);
+     if (!scope) return [];
+     return withoutLocallyUnsharedProjects(
+@@ -6171,6 +6252,17 @@ export async function startServer({
+   const teamMembersForDisplay = async (
+     context: WorkspaceCollabContext | null,
+   ): Promise<CollabCloudMemberDirectoryEntry[]> => {
++    if (proxyAuthEnabled) {
++      if (!context || !localTeamStore) return [];
++      if (context.workspaceType !== 'team') {
++        return [{
++          memberId: context.workspaceMemberId,
++          displayName: context.displayName ?? context.workspaceMemberId,
++          role: 'owner',
++        }];
++      }
++      return localTeamStore.memberDirectory(context.workspaceId);
++    }
+     if (!teamMembersCache) return [];
+     return context ? teamMembersCache(context) : [];
+   };
+@@ -6258,6 +6350,16 @@ export async function startServer({
+     }).catch(() => undefined);
+   };
+   let workspaceAnalyticsService: AnalyticsService | null = null;
++  if (proxyAuthEnabled) {
++    registerLocalTeamRoutes(app, {
++      getStore: () => localTeamStore,
++      onMembershipChanged: (workspaceId) => {
++        const at = Date.now();
++        emitWorkspaceEvent(workspaceId, { type: 'members-changed', at });
++        emitWorkspaceEvent(workspaceId, { type: 'workspace-context-changed', at });
++      },
++    });
++  }
+   registerCollabContextRoutes(app, {
+     workspaceContext: collab.workspaceContext,
+     configuredEnv: configuredAmrEnv,
+@@ -6316,7 +6418,29 @@ export async function startServer({
+     listTeamProjects: teamProjectsForDisplay,
+     // Expose the collab-cloud member directory so the web client can resolve
+     // comment authors + owner names to a name + role.
+-    ...(teamMembersCache ? { listMembers: teamMembersForDisplay } : {}),
++    ...(teamMembersCache || proxyAuthEnabled ? { listMembers: teamMembersForDisplay } : {}),
++    ...(proxyAuthEnabled
++      ? {
++          localTeams: {
++            invite: (workspaceId: string, items: Array<{ email: string; role: string }>) => {
++              const email = currentProxyEmail();
++              if (!email || !localTeamStore) {
++                return items.map((item) => ({ email: item.email, ok: false, error: 'no_session' }));
++              }
++              try {
++                return localTeamStore.addMembers(email, workspaceId, items).map((result) => ({
++                  email: result.email,
++                  ok: result.ok,
++                  ...(result.ok ? { inviteId: result.memberId } : { error: result.error }),
++                }));
++              } catch (error) {
++                const code = (error as { code?: string })?.code ?? 'create_failed';
++                return items.map((item) => ({ email: item.email, ok: false, error: code }));
++              }
++            },
++          },
++        }
++      : {}),
+     // Collab realtime hop-2: the workspace-scoped invalidation SSE. The route
+     // registers/deregisters its sink here; the poller below feeds them.
+     createSseResponse,
+-- 
+2.54.0 (Apple Git-157)
+

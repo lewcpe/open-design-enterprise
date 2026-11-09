@@ -1,0 +1,139 @@
+# Multi-user OpenDesign behind OIDC (oauth2-proxy) with self-service teams.
+#
+#   scripts/apply-patches.sh                        # patch the upstream/ submodule
+#   cp deploy/.env.oidc.example deploy/.env.oidc   # fill in the values
+#   docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc up -d --build
+#   # with the bundled Caddy TLS terminator:
+#   docker compose -f deploy/docker-compose.oidc.yml --env-file deploy/.env.oidc --profile tls up -d --build
+#
+# Security model (see README.md → "Security notes"):
+# - open-design publishes NO ports. Browsers can only reach it through
+#   oauth2-proxy, which authenticates against your IdP and forwards the
+#   verified email as X-Forwarded-Email (client-supplied copies are stripped).
+# - The daemon runs with OD_PROXY_AUTH=1: every non-loopback request must carry
+#   that header; workspace/team access is derived server-side from it.
+# - Never run oauth2-proxy or open-design with network_mode: host.
+
+name: open-design-oidc
+
+services:
+  open-design:
+    image: ${OPEN_DESIGN_IMAGE:-open-design-teams:local}
+    build:
+      context: ../upstream
+      dockerfile: deploy/Dockerfile
+    restart: always
+    environment:
+      NODE_ENV: production
+      NODE_OPTIONS: ${NODE_OPTIONS:---max-old-space-size=1024}
+      OD_BIND_HOST: 0.0.0.0
+      OD_PORT: 7456
+      OD_WEB_PORT: 7456
+      OD_ALLOWED_ORIGINS: ${OPEN_DESIGN_PUBLIC_URL:?set OPEN_DESIGN_PUBLIC_URL}
+      # Multi-user identity from the proxy (replaces the shared OD_API_TOKEN).
+      OD_PROXY_AUTH: "1"
+      OD_PROXY_EMAIL_HEADER: x-forwarded-email
+      OD_ADMIN_EMAILS: ${OD_ADMIN_EMAILS:?set OD_ADMIN_EMAILS}
+      OD_WORKSPACE_SETTINGS_URL: ${OPEN_DESIGN_PUBLIC_URL}/team-admin
+      # Model provider credentials shared by all users (admin-managed).
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      OD_CODEX_SANDBOX: ${OD_CODEX_SANDBOX:-}
+    volumes:
+      - open_design_data:/app/.od
+    networks:
+      - od-backend   # oauth2-proxy -> open-design only
+      - od-egress    # outbound model/API calls only
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: ${OPEN_DESIGN_MEM_LIMIT:-2g}
+    pids_limit: 512
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:7456/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:${OAUTH2_PROXY_VERSION:-v7.7.1}
+    restart: always
+    depends_on:
+      open-design:
+        condition: service_healthy
+    environment:
+      OAUTH2_PROXY_HTTP_ADDRESS: 0.0.0.0:4180
+      OAUTH2_PROXY_PROVIDER: oidc
+      OAUTH2_PROXY_OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?set OIDC_ISSUER_URL}
+      OAUTH2_PROXY_CLIENT_ID: ${OIDC_CLIENT_ID:?set OIDC_CLIENT_ID}
+      OAUTH2_PROXY_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?set OIDC_CLIENT_SECRET}
+      OAUTH2_PROXY_CODE_CHALLENGE_METHOD: S256
+      OAUTH2_PROXY_SCOPE: openid email profile ${OIDC_EXTRA_SCOPES:-}
+      OAUTH2_PROXY_REDIRECT_URL: ${OPEN_DESIGN_PUBLIC_URL}/oauth2/callback
+      OAUTH2_PROXY_EMAIL_DOMAINS: ${OIDC_EMAIL_DOMAINS:-*}
+      OAUTH2_PROXY_INSECURE_OIDC_ALLOW_UNVERIFIED_EMAIL: ${OIDC_ALLOW_UNVERIFIED_EMAIL:-false}
+      OAUTH2_PROXY_UPSTREAMS: http://open-design:7456
+      OAUTH2_PROXY_PASS_USER_HEADERS: "true"
+      OAUTH2_PROXY_PASS_ACCESS_TOKEN: "false"
+      OAUTH2_PROXY_PASS_AUTHORIZATION_HEADER: "false"
+      OAUTH2_PROXY_SET_XAUTHREQUEST: "false"
+      OAUTH2_PROXY_REVERSE_PROXY: "true"
+      OAUTH2_PROXY_SKIP_PROVIDER_BUTTON: "true"
+      OAUTH2_PROXY_COOKIE_SECRET: ${OAUTH2_PROXY_COOKIE_SECRET:?set OAUTH2_PROXY_COOKIE_SECRET}
+      OAUTH2_PROXY_COOKIE_SECURE: "true"
+      OAUTH2_PROXY_COOKIE_SAMESITE: lax
+      OAUTH2_PROXY_COOKIE_EXPIRE: ${OAUTH2_PROXY_COOKIE_EXPIRE:-168h}
+      OAUTH2_PROXY_COOKIE_REFRESH: ${OAUTH2_PROXY_COOKIE_REFRESH:-1h}
+      # Server-Sent Events: flush promptly and allow long-lived responses.
+      OAUTH2_PROXY_FLUSH_INTERVAL: 100ms
+      OAUTH2_PROXY_UPSTREAM_TIMEOUT: 600s
+      # Sandboxed preview iframes send no cookies. These paths carry a
+      # server-minted, project-scoped token that the daemon validates itself.
+      OAUTH2_PROXY_SKIP_AUTH_ROUTES: GET=^/api/projects/[^/]+/preview/[^/]+/
+    ports:
+      # Only for an external TLS load balancer on this host. Leave as-is when
+      # using the bundled Caddy (--profile tls).
+      - "${OAUTH2_PROXY_PUBLISH:-127.0.0.1:4180}:4180"
+    networks:
+      - od-backend
+      - frontend
+
+  caddy:
+    profiles: ["tls"]
+    image: caddy:${CADDY_VERSION:-2.8.4}-alpine
+    restart: always
+    depends_on:
+      - oauth2-proxy
+    environment:
+      OPEN_DESIGN_HOST: ${OPEN_DESIGN_HOST:?set OPEN_DESIGN_HOST}
+      CADDY_TLS: ${CADDY_TLS:-internal}
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./Caddyfile.oidc:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - frontend
+
+networks:
+  od-backend:
+    internal: true
+  od-egress: {}
+  frontend: {}
+
+volumes:
+  open_design_data:
+  caddy_data:
+  caddy_config:
