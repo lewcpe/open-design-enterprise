@@ -1,3 +1,4 @@
 [submodule "upstream"]
 	path = upstream
 	url = https://github.com/nexu-io/open-design.git
+	ignore = all
