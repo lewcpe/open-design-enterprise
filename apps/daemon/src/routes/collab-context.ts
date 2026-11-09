@@ -185,6 +185,17 @@ export interface RegisterCollabContextRoutesDeps {
     context: WorkspaceCollabContext,
   ) => Promise<CollabCloudMemberDirectoryEntry[]>;
   /**
+   * Proxy-authenticated self-hosted mode (OD_PROXY_AUTH): invites add members
+   * to the local team directory immediately instead of going through Vela, and
+   * the daemon-global dev workspace context cannot be overwritten by a user.
+   */
+  localTeams?: {
+    invite(
+      workspaceId: string,
+      items: Array<{ email: string; role: string }>,
+    ): WorkspaceInviteCreateResult[];
+  };
+  /**
    * Client-local restart default. Data-plane routes never use it as authority;
    * each tab continues to carry its exact Workspace and member identity.
    */
@@ -444,6 +455,13 @@ export function registerCollabContextRoutes(app: Express, deps: RegisterCollabCo
     if (!context.permissions.canInviteMembers ||
         (context.role !== 'owner' && items.some(item => item.role === 'admin'))) {
       return res.status(403).json({ error: 'forbidden' });
+    }
+
+    if (deps.localTeams) {
+      const body: WorkspaceInviteCreateResponse = {
+        results: deps.localTeams.invite(workspaceId, items),
+      };
+      return res.json(body);
     }
 
     const results: WorkspaceInviteCreateResult[] = [];
@@ -1139,6 +1157,9 @@ export function registerCollabContextRoutes(app: Express, deps: RegisterCollabCo
   // Dev/demo seam: override the in-memory context. A real B-backed provider does
   // not expose `set`, so this 404s in production instead of spoofing identity.
   app.put('/api/workspace/context', (req, res) => {
+    if (deps.localTeams) {
+      return res.status(403).json({ error: 'workspace context is managed by the identity proxy' });
+    }
     if (!workspaceContext.set) {
       return res.status(404).json({ error: 'workspace context is not settable' });
     }

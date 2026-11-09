@@ -8,6 +8,7 @@ import type { ProjectDeleteResponse } from '@open-design/contracts';
 import { publicFileMutationHandler } from '../public-file-mutation-handler.js';
 import { createPublicFileMutations, type PublicFileMutations } from '../../collab/public-file-mutations.js';
 import { rm } from 'node:fs/promises';
+import { currentProxyEmail, isProxyAuthEnabled } from '../../http/proxy-identity.js';
 import path from 'node:path';
 import { load } from 'cheerio';
 import {
@@ -3359,6 +3360,11 @@ export function registerProjectRoutes(app: Express, ctx: RegisterProjectRoutesDe
   });
 
   app.get('/api/projects', async (_req, res) => {
+    // Proxy-authenticated multi-user mode has no shared unbound catalog: every
+    // user's projects are listed through their workspace-scoped endpoint.
+    if (isProxyAuthEnabled() && currentProxyEmail()) {
+      return res.json({ projects: [] });
+    }
     try {
       const locations = await configuredProjectLocations();
       const latestRunStatuses = listLatestProjectRunStatuses(db);

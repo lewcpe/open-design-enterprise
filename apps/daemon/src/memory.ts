@@ -25,6 +25,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { MEMORY_TYPES, PROFILE_MEMORY_ID, parseFormAnswers } from '@open-design/contracts';
 import { parseFrontmatter } from './design-systems/frontmatter.js';
+import { isProxyAuthEnabled } from './http/proxy-identity.js';
 // Imported lazily through the memory-extractions module by the call
 // sites below so a future test-only build of memory.ts that stubs the
 // store can still tree-shake the ring buffer. We use a static import
@@ -196,7 +197,20 @@ function normalizeExtractionPatch(input) {
   return out;
 }
 
+// Proxy-authenticated multi-user mode: memory is one daemon-wide store, so
+// facts from one user's private chats would be injected into everyone's
+// prompts. Keep every memory hook off there.
+const PROXY_MODE_MEMORY_CONFIG = Object.freeze({
+  enabled: false,
+  chatExtractionEnabled: false,
+  profileEnabled: false,
+  rewriteEnabled: false,
+  verifyEnabled: false,
+  extraction: null,
+});
+
 export async function readMemoryConfig(dataDir) {
+  if (isProxyAuthEnabled()) return { ...PROXY_MODE_MEMORY_CONFIG };
   try {
     const raw = await fsp.readFile(configPath(dataDir), 'utf8');
     const parsed = JSON.parse(raw);

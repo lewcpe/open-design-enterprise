@@ -203,6 +203,10 @@ export function resolveWorkspaceSettingsUrl(
   // workspace another device left active, so every console link pins the id.
   // The low-cardinality source marker lets Vela attribute the resulting
   // Workspace management outcomes without carrying user-entered values.
+  // Self-hosted override (e.g. the proxy-mode /team-admin page) wins over any
+  // Vela console origin.
+  const selfHosted = env.OD_WORKSPACE_SETTINGS_URL?.trim();
+  if (selfHosted) return withWorkspaceDeepLink(selfHosted, workspaceId);
   const base = resolveEffectiveVelaConsoleOrigin(env, configuredEnv);
   const hasRuntimeProfile = Boolean(
     configuredEnv.OPEN_DESIGN_AMR_PROFILE?.trim() || configuredEnv.VELA_PROFILE?.trim(),

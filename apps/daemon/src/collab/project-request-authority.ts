@@ -1,5 +1,9 @@
 import type { Response } from 'express';
 import {
+  applyWorkspaceIdentityHeaders,
+  proxyMembershipFor,
+} from '../http/proxy-identity.js';
+import {
   requestWithWorkspaceNavigationScope,
   workspaceResourceContextFromRequest,
   type ResolveWorkspaceResourceReadAuthority,
@@ -214,7 +218,32 @@ export async function enforceLocalProjectDataPlaneRequest(input: {
     return false;
   };
   const persisted = getWorkspaceProjectByProjectId(db, projectId);
-  if (!persisted?.workspaceId) return true;
+  // Proxy-authenticated multi-user mode (OD_PROXY_AUTH): there is no shared
+  // "unbound" bucket, and requests that name no workspace (iframes, <img>,
+  // downloads) are scoped to the project's own workspace for the verified user.
+  const proxyMembership = persisted?.workspaceId
+    ? proxyMembershipFor(persisted.workspaceId)
+    : proxyMembershipFor('');
+  if (!persisted?.workspaceId) {
+    if (proxyMembership !== undefined) {
+      return deny(
+        403,
+        'WORKSPACE_PROJECT_PERMISSION_DENIED',
+        `workspace project ${options.mode} is not allowed`,
+      );
+    }
+    return true;
+  }
+  if (proxyMembership !== undefined && !req?.headers?.['x-od-workspace-id']) {
+    if (!proxyMembership || !req?.headers) {
+      return deny(
+        403,
+        'WORKSPACE_PROJECT_PERMISSION_DENIED',
+        `workspace project ${options.mode} is not allowed`,
+      );
+    }
+    applyWorkspaceIdentityHeaders(req, proxyMembership);
+  }
 
   const scopedRequest = options.mode === 'read' && options.allowNavigationQuery
     ? requestWithWorkspaceNavigationScope(req)

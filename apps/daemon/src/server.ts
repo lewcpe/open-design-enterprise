@@ -1221,6 +1221,15 @@ import {
   isApiAuthDisabled,
   isApiTokenMiddlewareEnabled,
 } from './api-token-auth.js';
+import {
+  createProxyIdentityMiddleware,
+  currentProxyEmail,
+  isProxyAuthEnabled,
+  requireGlobalSettingsWriter,
+  setProxyTeamStore,
+} from './http/proxy-identity.js';
+import { createLocalTeamStore, type LocalTeamStore } from './collab/local-teams.js';
+import { registerLocalTeamRoutes } from './routes/local-teams.js';
 import { createOpenDesignPublicMetadataService } from './services/open-design-public-metadata.js';
 import { createWhatsNewService } from './services/whats-new.js';
 import { execCommandViaLoginShell } from './services/login-shell.js';
@@ -3246,10 +3255,13 @@ export async function startServer({
   // are exempted so the desktop UI keeps working).
   const apiToken = apiTokenFromEnv();
   const apiAuthDisabled = isApiAuthDisabled();
-  const apiTokenAuthEnabled = apiToken.length > 0 && !apiAuthDisabled;
+  // OD_PROXY_AUTH: an authenticating reverse proxy asserts the user's email;
+  // the proxy identity middleware (below) replaces the shared-token gate.
+  const proxyAuthEnabled = isProxyAuthEnabled();
+  const apiTokenAuthEnabled = apiToken.length > 0 && !apiAuthDisabled && !proxyAuthEnabled;
   const isApiTokenAuthorization = (authorization: string | undefined): boolean =>
     apiTokenAuthEnabled && apiTokenAuthorizationMatches(authorization, apiToken);
-  if (!isLoopbackHostname(host) && apiToken.length === 0 && !apiAuthDisabled) {
+  if (!isLoopbackHostname(host) && apiToken.length === 0 && !apiAuthDisabled && !proxyAuthEnabled) {
     throw new Error(
       `OD_BIND_HOST=${host} requires OD_API_TOKEN to be set. ` +
       `Generate one with \`openssl rand -hex 32\` and re-launch. ` +
@@ -3303,6 +3315,36 @@ export async function startServer({
   app.use(CHAT_SCROLL_FORENSICS_PATH, chatScrollForensicsBodyParser);
   app.use(express.json({ limit: '4mb', verify: captureJsonBodySize }));
   const projectPreviewScopes = createProjectPreviewScopeRegistry();
+  // Proxy-authenticated multi-user mode. SQLite opens later in startup, so the
+  // team store is bound lazily; requests only arrive after listen().
+  let localTeamStore: LocalTeamStore | null = null;
+  if (proxyAuthEnabled) {
+    app.use(createProxyIdentityMiddleware({
+      getStore: () => localTeamStore,
+      isLoopbackPeer: (address) => isLoopbackPeerAddress(address),
+      classifyPreviewRequest: (req) => {
+        if (!req.path.startsWith('/api/')) return null;
+        const previewAsset = parseProjectPreviewAssetPath(req.path.slice('/api'.length));
+        if (!previewAsset) return null;
+        return projectPreviewScopes.validate(previewAsset.projectId, previewAsset.scope)
+          ? 'valid'
+          : 'invalid';
+      },
+    }));
+    // Daemon-wide settings (agent/API keys, MCP, connectors, memory, project
+    // locations) are shared by every user: only OD_ADMIN_EMAILS may change them.
+    for (const prefix of [
+      '/api/app-config',
+      '/api/media/config',
+      '/api/mcp',
+      '/api/connectors',
+      '/api/integrations',
+      '/api/memory',
+      '/api/project-locations',
+    ]) {
+      app.use(prefix, requireGlobalSettingsWriter);
+    }
+  }
 
   // Plan §3.K1 — API-token middleware.
   //
@@ -3584,6 +3626,10 @@ export async function startServer({
     previousLogPath: resolveDaemonPreviousLogPath(runtime),
   });
   const db = openDatabase(PROJECT_ROOT, { dataDir: RUNTIME_DATA_DIR });
+  if (proxyAuthEnabled) {
+    localTeamStore = createLocalTeamStore(db);
+    setProxyTeamStore(localTeamStore);
+  }
   daemonHealth?.setStorageProbe(() => readSqlitePageStats({ db, file: db.name }));
   const amrTerminalReportOutbox = createAmrTerminalReportOutboxStore(db);
   // P0-24 N10: notices for turns that end while this process runs (never replayed).
@@ -3990,11 +4036,25 @@ export async function startServer({
       void revokedWorkspaceRuns?.observeDirectory(proof.actorKey, result.items);
     },
   });
-  const fetchWorkspaceDirectory = workspaceDirectoryAuthority.read;
-  const fetchFreshMutationWorkspaceDirectory =
-    workspaceDirectoryAuthority.fresh;
-  const fetchFreshBackgroundWorkspaceDirectory =
-    workspaceDirectoryAuthority.backgroundFresh;
+  // Proxy mode: the membership directory is the local team store, resolved
+  // per request for the proxy-asserted user. Never use the broker's shared
+  // lease here — it is keyed to one daemon-wide Vela session, not to a user.
+  const fetchLocalTeamDirectory = async () => {
+    const email = currentProxyEmail();
+    return {
+      ok: true,
+      items: email && localTeamStore ? localTeamStore.directoryFor(email) : [],
+    };
+  };
+  const fetchWorkspaceDirectory = proxyAuthEnabled
+    ? fetchLocalTeamDirectory
+    : workspaceDirectoryAuthority.read;
+  const fetchFreshMutationWorkspaceDirectory = proxyAuthEnabled
+    ? fetchLocalTeamDirectory
+    : workspaceDirectoryAuthority.fresh;
+  const fetchFreshBackgroundWorkspaceDirectory = proxyAuthEnabled
+    ? fetchLocalTeamDirectory
+    : workspaceDirectoryAuthority.backgroundFresh;
   let workspaceHubSubscriptions: WorkspaceHubSubscriptionManager | null = null;
   const quotaHealthyConnections = new Set<string>();
   const verifyExplicitWorkspaceRequestContext = async (input: {
@@ -4046,17 +4106,33 @@ export async function startServer({
         message: 'the requested workspace is not available to this member',
       };
     }
+    // Proxy mode: headers were already re-derived from the local directory by
+    // the identity middleware; reuse the real team name and user email.
+    const proxyEmail = proxyAuthEnabled ? currentProxyEmail() : null;
+    const proxyItem = proxyEmail
+      ? localTeamStore?.membershipFor(proxyEmail, claimed.workspaceId) ?? null
+      : null;
+    if (proxyEmail && !proxyItem) {
+      return {
+        ok: false as const,
+        status: 403 as const,
+        code: 'WORKSPACE_ACCESS_DENIED' as const,
+        message: 'the requested workspace is not available to this member',
+      };
+    }
+    const context = workspaceContextFromDirectoryItem(proxyItem ?? {
+      workspaceId: claimed.workspaceId,
+      workspaceName: claimed.workspaceId,
+      workspaceType: claimed.workspaceType,
+      workspaceMemberId: claimed.workspaceMemberId,
+      role: claimed.role,
+      memberStatus: claimed.memberStatus,
+      lifecycleState: claimed.lifecycleState,
+    }, configuredAmrEnv());
+    if (proxyEmail) context.displayName = proxyEmail;
     return {
       ok: true as const,
-      context: workspaceContextFromDirectoryItem({
-        workspaceId: claimed.workspaceId,
-        workspaceName: claimed.workspaceId,
-        workspaceType: claimed.workspaceType,
-        workspaceMemberId: claimed.workspaceMemberId,
-        role: claimed.role,
-        memberStatus: claimed.memberStatus,
-        lifecycleState: claimed.lifecycleState,
-      }, configuredAmrEnv()),
+      context,
     };
   };
   const verifyWorkspaceReadAuthority = (req: unknown) =>
@@ -4944,6 +5020,11 @@ export async function startServer({
   const teamProjectsForDisplay = async (
     context: WorkspaceCollabContext | null,
   ): Promise<TeamProject[]> => {
+    if (proxyAuthEnabled) {
+      return context?.workspaceType === 'team' && localTeamStore
+        ? localTeamStore.listTeamProjects(context.workspaceId)
+        : [];
+    }
     const scope = teamProjectsDisplayScopeFromContext(context);
     if (!scope) return [];
     return withoutLocallyUnsharedProjects(
@@ -6171,6 +6252,17 @@ export async function startServer({
   const teamMembersForDisplay = async (
     context: WorkspaceCollabContext | null,
   ): Promise<CollabCloudMemberDirectoryEntry[]> => {
+    if (proxyAuthEnabled) {
+      if (!context || !localTeamStore) return [];
+      if (context.workspaceType !== 'team') {
+        return [{
+          memberId: context.workspaceMemberId,
+          displayName: context.displayName ?? context.workspaceMemberId,
+          role: 'owner',
+        }];
+      }
+      return localTeamStore.memberDirectory(context.workspaceId);
+    }
     if (!teamMembersCache) return [];
     return context ? teamMembersCache(context) : [];
   };
@@ -6258,6 +6350,16 @@ export async function startServer({
     }).catch(() => undefined);
   };
   let workspaceAnalyticsService: AnalyticsService | null = null;
+  if (proxyAuthEnabled) {
+    registerLocalTeamRoutes(app, {
+      getStore: () => localTeamStore,
+      onMembershipChanged: (workspaceId) => {
+        const at = Date.now();
+        emitWorkspaceEvent(workspaceId, { type: 'members-changed', at });
+        emitWorkspaceEvent(workspaceId, { type: 'workspace-context-changed', at });
+      },
+    });
+  }
   registerCollabContextRoutes(app, {
     workspaceContext: collab.workspaceContext,
     configuredEnv: configuredAmrEnv,
@@ -6316,7 +6418,29 @@ export async function startServer({
     listTeamProjects: teamProjectsForDisplay,
     // Expose the collab-cloud member directory so the web client can resolve
     // comment authors + owner names to a name + role.
-    ...(teamMembersCache ? { listMembers: teamMembersForDisplay } : {}),
+    ...(teamMembersCache || proxyAuthEnabled ? { listMembers: teamMembersForDisplay } : {}),
+    ...(proxyAuthEnabled
+      ? {
+          localTeams: {
+            invite: (workspaceId: string, items: Array<{ email: string; role: string }>) => {
+              const email = currentProxyEmail();
+              if (!email || !localTeamStore) {
+                return items.map((item) => ({ email: item.email, ok: false, error: 'no_session' }));
+              }
+              try {
+                return localTeamStore.addMembers(email, workspaceId, items).map((result) => ({
+                  email: result.email,
+                  ok: result.ok,
+                  ...(result.ok ? { inviteId: result.memberId } : { error: result.error }),
+                }));
+              } catch (error) {
+                const code = (error as { code?: string })?.code ?? 'create_failed';
+                return items.map((item) => ({ email: item.email, ok: false, error: code }));
+              }
+            },
+          },
+        }
+      : {}),
     // Collab realtime hop-2: the workspace-scoped invalidation SSE. The route
     // registers/deregisters its sink here; the poller below feeds them.
     createSseResponse,
