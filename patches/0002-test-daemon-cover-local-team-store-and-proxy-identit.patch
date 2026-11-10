@@ -14,7 +14,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/apps/daemon/tests/local-teams.test.ts b/apps/daemon/tests/local-teams.test.ts
 new file mode 100644
-index 0000000000..7f57d7b534
+index 000000000..7f57d7b53
 --- /dev/null
 +++ b/apps/daemon/tests/local-teams.test.ts
 @@ -0,0 +1,128 @@
@@ -148,7 +148,7 @@ index 0000000000..7f57d7b534
 +});
 diff --git a/apps/daemon/tests/proxy-identity.test.ts b/apps/daemon/tests/proxy-identity.test.ts
 new file mode 100644
-index 0000000000..3e1a3ccea0
+index 000000000..3e1a3ccea
 --- /dev/null
 +++ b/apps/daemon/tests/proxy-identity.test.ts
 @@ -0,0 +1,195 @@

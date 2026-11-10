@@ -44,7 +44,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/apps/daemon/src/collab/local-teams.ts b/apps/daemon/src/collab/local-teams.ts
 new file mode 100644
-index 0000000000..6a22cfa1b7
+index 000000000..6a22cfa1b
 --- /dev/null
 +++ b/apps/daemon/src/collab/local-teams.ts
 @@ -0,0 +1,338 @@
@@ -387,7 +387,7 @@ index 0000000000..6a22cfa1b7
 +  };
 +}
 diff --git a/apps/daemon/src/collab/project-request-authority.ts b/apps/daemon/src/collab/project-request-authority.ts
-index 76e07eb3a9..b01bbb593b 100644
+index e11d7cee1..ed1a0124d 100644
 --- a/apps/daemon/src/collab/project-request-authority.ts
 +++ b/apps/daemon/src/collab/project-request-authority.ts
 @@ -1,4 +1,8 @@
@@ -434,7 +434,7 @@ index 76e07eb3a9..b01bbb593b 100644
    const scopedRequest = options.mode === 'read' && options.allowNavigationQuery
      ? requestWithWorkspaceNavigationScope(req)
 diff --git a/apps/daemon/src/collab/workspace-context.ts b/apps/daemon/src/collab/workspace-context.ts
-index 2e3f598a90..65b3d1dc13 100644
+index 2e3f598a9..65b3d1dc1 100644
 --- a/apps/daemon/src/collab/workspace-context.ts
 +++ b/apps/daemon/src/collab/workspace-context.ts
 @@ -203,6 +203,10 @@ export function resolveWorkspaceSettingsUrl(
@@ -450,7 +450,7 @@ index 2e3f598a90..65b3d1dc13 100644
      configuredEnv.OPEN_DESIGN_AMR_PROFILE?.trim() || configuredEnv.VELA_PROFILE?.trim(),
 diff --git a/apps/daemon/src/http/proxy-identity.ts b/apps/daemon/src/http/proxy-identity.ts
 new file mode 100644
-index 0000000000..488f08891e
+index 000000000..488f08891
 --- /dev/null
 +++ b/apps/daemon/src/http/proxy-identity.ts
 @@ -0,0 +1,234 @@
@@ -689,7 +689,7 @@ index 0000000000..488f08891e
 +  };
 +}
 diff --git a/apps/daemon/src/memory.ts b/apps/daemon/src/memory.ts
-index 644c8cb77a..7f76ff8cb3 100644
+index 644c8cb77..7f76ff8cb 100644
 --- a/apps/daemon/src/memory.ts
 +++ b/apps/daemon/src/memory.ts
 @@ -25,6 +25,7 @@ import path from 'node:path';
@@ -722,7 +722,7 @@ index 644c8cb77a..7f76ff8cb3 100644
      const raw = await fsp.readFile(configPath(dataDir), 'utf8');
      const parsed = JSON.parse(raw);
 diff --git a/apps/daemon/src/routes/collab-context.ts b/apps/daemon/src/routes/collab-context.ts
-index e07916b7a3..806aab61bd 100644
+index e07916b7a..806aab61b 100644
 --- a/apps/daemon/src/routes/collab-context.ts
 +++ b/apps/daemon/src/routes/collab-context.ts
 @@ -184,6 +184,17 @@ export interface RegisterCollabContextRoutesDeps {
@@ -769,7 +769,7 @@ index e07916b7a3..806aab61bd 100644
      }
 diff --git a/apps/daemon/src/routes/local-teams-page.ts b/apps/daemon/src/routes/local-teams-page.ts
 new file mode 100644
-index 0000000000..3eeab8a676
+index 000000000..3eeab8a67
 --- /dev/null
 +++ b/apps/daemon/src/routes/local-teams-page.ts
 @@ -0,0 +1,190 @@
@@ -965,7 +965,7 @@ index 0000000000..3eeab8a676
 +`;
 diff --git a/apps/daemon/src/routes/local-teams.ts b/apps/daemon/src/routes/local-teams.ts
 new file mode 100644
-index 0000000000..97938fb1c3
+index 000000000..97938fb1c
 --- /dev/null
 +++ b/apps/daemon/src/routes/local-teams.ts
 @@ -0,0 +1,104 @@
@@ -1074,7 +1074,7 @@ index 0000000000..97938fb1c3
 +  }));
 +}
 diff --git a/apps/daemon/src/routes/project/index.ts b/apps/daemon/src/routes/project/index.ts
-index ed6b253da3..9cee74d825 100644
+index ed6b253da..9cee74d82 100644
 --- a/apps/daemon/src/routes/project/index.ts
 +++ b/apps/daemon/src/routes/project/index.ts
 @@ -8,6 +8,7 @@ import type { ProjectDeleteResponse } from '@open-design/contracts';
@@ -1098,10 +1098,10 @@ index ed6b253da3..9cee74d825 100644
        const locations = await configuredProjectLocations();
        const latestRunStatuses = listLatestProjectRunStatuses(db);
 diff --git a/apps/daemon/src/server.ts b/apps/daemon/src/server.ts
-index db74d16779..4f57b86dd9 100644
+index ac67036be..95ad9a106 100644
 --- a/apps/daemon/src/server.ts
 +++ b/apps/daemon/src/server.ts
-@@ -1221,6 +1221,15 @@ import {
+@@ -1222,6 +1222,15 @@ import {
    isApiAuthDisabled,
    isApiTokenMiddlewareEnabled,
  } from './api-token-auth.js';
@@ -1117,7 +1117,7 @@ index db74d16779..4f57b86dd9 100644
  import { createOpenDesignPublicMetadataService } from './services/open-design-public-metadata.js';
  import { createWhatsNewService } from './services/whats-new.js';
  import { execCommandViaLoginShell } from './services/login-shell.js';
-@@ -3246,10 +3255,13 @@ export async function startServer({
+@@ -3247,10 +3256,13 @@ export async function startServer({
    // are exempted so the desktop UI keeps working).
    const apiToken = apiTokenFromEnv();
    const apiAuthDisabled = isApiAuthDisabled();
@@ -1133,7 +1133,7 @@ index db74d16779..4f57b86dd9 100644
      throw new Error(
        `OD_BIND_HOST=${host} requires OD_API_TOKEN to be set. ` +
        `Generate one with \`openssl rand -hex 32\` and re-launch. ` +
-@@ -3303,6 +3315,36 @@ export async function startServer({
+@@ -3304,6 +3316,36 @@ export async function startServer({
    app.use(CHAT_SCROLL_FORENSICS_PATH, chatScrollForensicsBodyParser);
    app.use(express.json({ limit: '4mb', verify: captureJsonBodySize }));
    const projectPreviewScopes = createProjectPreviewScopeRegistry();
@@ -1170,7 +1170,7 @@ index db74d16779..4f57b86dd9 100644
  
    // Plan §3.K1 — API-token middleware.
    //
-@@ -3583,6 +3625,10 @@ export async function startServer({
+@@ -3585,6 +3627,10 @@ export async function startServer({
      previousLogPath: resolveDaemonPreviousLogPath(runtime),
    });
    const db = openDatabase(PROJECT_ROOT, { dataDir: RUNTIME_DATA_DIR });
@@ -1181,7 +1181,7 @@ index db74d16779..4f57b86dd9 100644
    daemonHealth?.setStorageProbe(() => readSqlitePageStats({ db, file: db.name }));
    const amrTerminalReportOutbox = createAmrTerminalReportOutboxStore(db);
    // P0-24 N10: notices for turns that end while this process runs (never replayed).
-@@ -3989,11 +4035,25 @@ export async function startServer({
+@@ -3991,11 +4037,25 @@ export async function startServer({
        void revokedWorkspaceRuns?.observeDirectory(proof.actorKey, result.items);
      },
    });
@@ -1212,7 +1212,7 @@ index db74d16779..4f57b86dd9 100644
    let workspaceHubSubscriptions: WorkspaceHubSubscriptionManager | null = null;
    const quotaHealthyConnections = new Set<string>();
    const verifyExplicitWorkspaceRequestContext = async (input: {
-@@ -4045,17 +4105,33 @@ export async function startServer({
+@@ -4047,17 +4107,33 @@ export async function startServer({
          message: 'the requested workspace is not available to this member',
        };
      }
@@ -1255,7 +1255,7 @@ index db74d16779..4f57b86dd9 100644
      };
    };
    const verifyWorkspaceReadAuthority = (req: unknown) =>
-@@ -4943,6 +5019,11 @@ export async function startServer({
+@@ -4945,6 +5021,11 @@ export async function startServer({
    const teamProjectsForDisplay = async (
      context: WorkspaceCollabContext | null,
    ): Promise<TeamProject[]> => {
@@ -1267,7 +1267,7 @@ index db74d16779..4f57b86dd9 100644
      const scope = teamProjectsDisplayScopeFromContext(context);
      if (!scope) return [];
      return withoutLocallyUnsharedProjects(
-@@ -6170,6 +6251,17 @@ export async function startServer({
+@@ -6167,6 +6248,17 @@ export async function startServer({
    const teamMembersForDisplay = async (
      context: WorkspaceCollabContext | null,
    ): Promise<CollabCloudMemberDirectoryEntry[]> => {
@@ -1285,7 +1285,7 @@ index db74d16779..4f57b86dd9 100644
      if (!teamMembersCache) return [];
      return context ? teamMembersCache(context) : [];
    };
-@@ -6257,6 +6349,16 @@ export async function startServer({
+@@ -6254,6 +6346,16 @@ export async function startServer({
      }).catch(() => undefined);
    };
    let workspaceAnalyticsService: AnalyticsService | null = null;
@@ -1302,7 +1302,7 @@ index db74d16779..4f57b86dd9 100644
    registerCollabContextRoutes(app, {
      workspaceContext: collab.workspaceContext,
      configuredEnv: configuredAmrEnv,
-@@ -6315,7 +6417,29 @@ export async function startServer({
+@@ -6312,7 +6414,29 @@ export async function startServer({
      listTeamProjects: teamProjectsForDisplay,
      // Expose the collab-cloud member directory so the web client can resolve
      // comment authors + owner names to a name + role.
