@@ -1098,7 +1098,7 @@ index ed6b253da..9cee74d82 100644
        const locations = await configuredProjectLocations();
        const latestRunStatuses = listLatestProjectRunStatuses(db);
 diff --git a/apps/daemon/src/server.ts b/apps/daemon/src/server.ts
-index ac67036be..95ad9a106 100644
+index 4161e93a0..40dff216e 100644
 --- a/apps/daemon/src/server.ts
 +++ b/apps/daemon/src/server.ts
 @@ -1222,6 +1222,15 @@ import {
